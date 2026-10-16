@@ -1,0 +1,3 @@
+# Optional geospatial reader for public Sentinel-2 Cloud Optimized GeoTIFFs.
+# Install into the existing venv only when using the Historical Imagery page.
+rasterio>=1.4.3,<2
