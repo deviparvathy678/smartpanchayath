@@ -45,11 +45,8 @@ CSS = """
 }
 [data-testid="stAppViewContainer"] > .main .block-container {
   max-width: 1440px;
-  padding: 1.2rem 1.5rem 2.1rem;
-  background: var(--sp-surface);
-  border: 1px solid var(--sp-border);
-  border-radius: 8px;
-  box-shadow: 0 1px 3px rgba(23, 50, 77, .05);
+  padding: 1.35rem 2rem 2.4rem;
+  background: transparent;
 }
 
 /* Government-style navy navigation with a clear active state. */
@@ -116,6 +113,12 @@ CSS = """
   font-size: .77rem;
   margin-top: .12rem;
 }
+.sp-sidebar-description {
+  color: #D8E2EA;
+  font-size: .78rem;
+  line-height: 1.45;
+  margin: .25rem 0 .9rem;
+}
 .sp-appbar {
   display: flex;
   justify-content: space-between;
@@ -157,10 +160,10 @@ textarea::selection {
 [data-testid="stMetric"] {
   background: var(--sp-surface);
   border: 1px solid var(--sp-border);
-  border-left: 3px solid var(--sp-secondary);
-  border-radius: 6px;
-  padding: .76rem .9rem;
-  box-shadow: 0 1px 2px rgba(23, 50, 77, .04);
+  border-top: 3px solid var(--sp-secondary);
+  border-radius: 10px;
+  padding: .95rem 1rem;
+  box-shadow: 0 3px 12px rgba(23, 50, 77, .055);
 }
 [data-testid="stMetricLabel"] { color: var(--sp-muted) !important; font-size: .82rem; }
 [data-testid="stMetricValue"] {
@@ -225,6 +228,32 @@ div[data-testid="stDataFrame"] {
 [data-testid="stExpander"] { border-color: var(--sp-border); border-radius: 6px; }
 [data-testid="stAlert"] { border-radius: 6px; }
 
+.sp-page-kicker {
+  color: var(--sp-secondary);
+  font-size: .72rem;
+  font-weight: 750;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  margin: .2rem 0 .35rem;
+}
+.sp-page-subtitle { color: var(--sp-muted); margin-top: -.15rem; }
+.sp-dashboard-hero {
+  background: linear-gradient(110deg, #FFFFFF 0%, #F2F7FA 100%);
+  border: 1px solid var(--sp-border);
+  border-left: 5px solid #247F83;
+  border-radius: 12px;
+  padding: 1.25rem 1.45rem;
+  margin: .3rem 0 1.15rem;
+  box-shadow: 0 4px 16px rgba(23, 50, 77, .05);
+}
+.sp-dashboard-hero h1 { margin: 0 !important; }
+.sp-dashboard-hero p { color: var(--sp-muted); margin: .35rem 0 0; max-width: 760px; }
+.sp-table-wrap, [data-testid="stDataFrame"] {
+  border: 1px solid var(--sp-border);
+  border-radius: 9px;
+  overflow: hidden;
+}
+
 .sp-section-label {
   color: var(--sp-muted);
   font-size: .68rem;
@@ -269,7 +298,6 @@ div[data-testid="stDataFrame"] {
 @media (max-width: 760px) {
   [data-testid="stAppViewContainer"] > .main .block-container {
     padding: .8rem .85rem 1.5rem;
-    border-radius: 0;
   }
   .sp-appbar { align-items: flex-start; }
   h1 { font-size: 1.55rem !important; }
@@ -299,6 +327,32 @@ def render_section_header(streamlit, title, subtitle=None):
     streamlit.subheader(title)
     if subtitle:
         streamlit.caption(subtitle)
+
+
+def render_page_header(streamlit, title, subtitle=None, eyebrow=None):
+    if eyebrow:
+        streamlit.markdown(
+            f'<div class="sp-page-kicker">{escape(str(eyebrow))}</div>',
+            unsafe_allow_html=True,
+        )
+    streamlit.title(title)
+    if subtitle:
+        streamlit.markdown(
+            f'<div class="sp-page-subtitle">{escape(str(subtitle))}</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_dashboard_hero(streamlit, title, subtitle, eyebrow=None):
+    eyebrow_html = (
+        f'<div class="sp-page-kicker">{escape(str(eyebrow))}</div>' if eyebrow else ""
+    )
+    streamlit.markdown(
+        '<section class="sp-dashboard-hero">'
+        f"{eyebrow_html}<h1>{escape(str(title))}</h1>"
+        f"<p>{escape(str(subtitle))}</p></section>",
+        unsafe_allow_html=True,
+    )
 
 
 def render_result_summary(streamlit, title, status, note):

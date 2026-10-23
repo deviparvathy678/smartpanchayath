@@ -18,8 +18,10 @@ from streamlit_folium import st_folium
 from PIL import Image, UnidentifiedImageError
 from ui_theme import (
     apply_theme,
+    render_dashboard_hero,
     render_header,
     render_metric_card,
+    render_page_header,
     render_result_summary,
     render_section_header,
     render_status_badge,
@@ -915,11 +917,23 @@ def render_dashboard():
         for row in image_detections
     )
 
-    st.header("Dashboard")
-    st.caption("Overview of monitored properties and investigations")
+    render_dashboard_hero(
+        st,
+        "Construction Monitoring Dashboard",
+        "A municipal workspace for monitoring property records, reviewing reported changes, and coordinating follow-up.",
+        "SmartPanchayat · Overview",
+    )
     demo_message = st.session_state.pop("demo_cases_message", None)
     if demo_message:
         st.success(demo_message)
+
+    action_columns = st.columns([1, 1, 3])
+    if action_columns[0].button("Register New Case", type="primary", use_container_width=True):
+        _choose_navigation("Register case")
+        st.rerun()
+    if action_columns[1].button("Open GPS Property Map", use_container_width=True):
+        _choose_navigation("GPS Property Map")
+        st.rerun()
 
     risk_records = load_all_risk_assessments()
     risk_counts = {
@@ -931,22 +945,19 @@ def render_dashboard():
     under_review_count = pending_count + investigation_count + additional_info_count
     high_priority_count = risk_counts.get("HIGH PRIORITY", 0) + risk_counts.get("CRITICAL REVIEW", 0)
 
-    metric_rows = [
-        [
-            ("Total Cases", total_count),
-            ("High Priority", high_priority_count),
-            ("Under Review", under_review_count),
-        ],
-        [
-            ("Properties", property_count),
-            ("Permit Checks", permit_awaiting_count),
-            ("Resolved", resolved_count),
-        ],
-    ]
-    for row in metric_rows:
-        metric_cols = st.columns(3)
-        for column, (label, value) in zip(metric_cols, row):
-            column.metric(label, value)
+    summary_columns = st.columns(4)
+    for column, label, value, help_text in zip(
+        summary_columns,
+        ("Total registered cases", "Pending review", "Under investigation", "Resolved"),
+        (total_count, pending_count, investigation_count, resolved_count),
+        (
+            "Construction cases and saved image-change reviews.",
+            "Records awaiting an initial officer review.",
+            "Records currently under investigation.",
+            "Records marked resolved in the review workflow.",
+        ),
+    ):
+        render_metric_card(column, label, value, help_text)
 
     dashboard_confidence = mean_evidence_confidence([
         confidence_from_saved_reports(
@@ -971,7 +982,7 @@ def render_dashboard():
     )
     st.caption("Investigation priority supports triage; it is not a legal finding.")
 
-    st.subheader("Recent investigations")
+    render_section_header(st, "Recent cases", "The latest saved construction cases and image-change reviews.")
     recent_rows = []
     for case in cases:
         risk = load_risk_assessment("construction", case["case_id"])
@@ -982,6 +993,7 @@ def render_dashboard():
             "Risk": risk["risk_category"] if risk else "Not assessed",
             "Status": get_review_status(case),
             "Date": case["inspection_date"] or "Not recorded",
+            "_key": f"construction|{case['case_id']}",
         })
     for detection in image_detections:
         risk = load_risk_assessment("image_detection", detection["case_id"])
@@ -992,14 +1004,38 @@ def render_dashboard():
             "Risk": risk["risk_category"] if risk else "Not assessed",
             "Status": get_review_status(detection),
             "Date": detection["detection_date"] or detection["created_at"] or "Not recorded",
+            "_key": f"image_detection|{detection['case_id']}",
         })
     recent_rows.sort(key=lambda row: str(row["Date"]), reverse=True)
     content_col, summary_col = st.columns((2.1, 1))
     with content_col:
         if recent_rows:
-            st.dataframe(recent_rows[:8], width="stretch", hide_index=True)
+            latest_rows = recent_rows[:8]
+            st.dataframe(
+                [{key: value for key, value in row.items() if key != "_key"} for row in latest_rows],
+                width="stretch",
+                hide_index=True,
+            )
+            labels = {
+                f"{row['Case ID']} · {row['Property']} · {row['Status']}": row
+                for row in latest_rows
+            }
+            selected_label = st.selectbox(
+                "Open a recent case",
+                list(labels),
+                label_visibility="collapsed",
+                key="dashboard_recent_case",
+            )
+            if st.button("Open selected case", key="dashboard_open_case"):
+                st.session_state["saved_case_search"] = labels[selected_label]["Case ID"]
+                st.session_state["saved_cases_status_filter"] = "All statuses"
+                _choose_navigation("Saved cases")
+                st.rerun()
         else:
-            st.info("No cases have been recorded yet.")
+            st.info("No cases have been recorded yet. Register the first case to begin monitoring.")
+            if st.button("Register the first case", type="primary", key="dashboard_empty_register"):
+                _choose_navigation("Register case")
+                st.rerun()
     with summary_col:
         st.markdown("#### Investigation summary")
         st.dataframe(
@@ -1043,6 +1079,36 @@ def render_dashboard():
                 "Existing demo IDs were left unchanged."
             )
             st.rerun()
+
+
+def render_about_system():
+    render_page_header(
+        st,
+        "About the System",
+        "A local civic monitoring prototype for organizing property observations and officer review.",
+        "SmartPanchayat · System guide",
+    )
+    left, right = st.columns((1.4, 1))
+    with left:
+        st.subheader("What this prototype supports")
+        st.markdown(
+            "- Construction case registration and review status tracking\n"
+            "- Property location records with officer-selected coordinates\n"
+            "- OpenCV and NumPy comparison of earlier and recent images\n"
+            "- Saved image-change reviews, officer alerts, and local audit history"
+        )
+        st.info(
+            "A visual difference is a review lead. It does not establish illegal construction, "
+            "permit status, or legal compliance."
+        )
+    with right:
+        st.subheader("Data and map notes")
+        st.markdown(
+            "- Case data is stored in the local SQLite database.\n"
+            "- Map coordinates are saved only from entered or selected locations.\n"
+            "- The property map uses OpenStreetMap base tiles; it does not show live satellite imagery.\n"
+            "- This local prototype does not provide authentication or official-government verification."
+        )
 
 
 def render_case_registration():
@@ -1784,6 +1850,34 @@ def _render_saved_image_detections(detections):
         "construction or permit violations. Evidence files remain in the app's "
         "local evidence folder and are not shown as filesystem paths."
     )
+    search_text = st.text_input(
+        "Search image-change cases",
+        placeholder="Case ID, property reference, monitoring area, or ward",
+        key="saved_image_case_search",
+    )
+    status_options = ["All statuses", *REVIEW_STATUSES]
+    status_filter = st.selectbox(
+        "Image-change review status",
+        status_options,
+        key="saved_image_case_status_filter",
+    )
+    query = search_text.strip().casefold()
+    detections = [
+        detection
+        for detection in detections
+        if (status_filter == "All statuses" or detection["review_status"] == status_filter)
+        and (
+            not query
+            or query
+            in " ".join(
+                str(detection[key] or "")
+                for key in ("case_id", "building_reference", "monitoring_area", "ward_number")
+            ).casefold()
+        )
+    ]
+    if not detections:
+        st.info("No image-change cases match these filters.")
+        return
     rows = []
     for detection in detections:
         rows.append(
@@ -1827,7 +1921,12 @@ def _render_saved_image_detections(detections):
 
 
 def render_case_register():
-    st.header("Saved construction cases")
+    render_page_header(
+        st,
+        "Saved Cases",
+        "Search and review the case records currently stored in the local database.",
+        "Cases · Register",
+    )
     cases = load_cases()
     image_detections = load_image_detections()
 
@@ -1842,9 +1941,30 @@ def render_case_register():
         _render_saved_image_detections(image_detections)
         return
 
-    st.caption(f"{len(cases)} case(s) saved in the local SQLite database.")
+    st.caption(f"{len(cases)} construction case(s) saved in the local SQLite database.")
+    search_text = st.text_input(
+        "Search cases",
+        placeholder="Case ID, property reference, address, or ward",
+        key="saved_case_search",
+    )
+    status_options = ["All statuses", *REVIEW_STATUSES]
+    status_filter = st.selectbox("Review status", status_options, key="saved_cases_status_filter")
+    filtered_cases = [
+        case for case in cases
+        if (status_filter == "All statuses" or get_review_status(case) == status_filter)
+        and (
+            not search_text.strip()
+            or search_text.strip().casefold()
+            in " ".join(
+                str(case[key] or "")
+                for key in ("case_id", "building_reference", "site_address", "ward_number")
+            ).casefold()
+        )
+    ]
+    if not filtered_cases:
+        st.info("No construction cases match these filters.")
     rows = []
-    for case in cases:
+    for case in filtered_cases:
         reasons = assess_case(case)
         rows.append(
             {
@@ -1861,9 +1981,10 @@ def render_case_register():
                 "Alert": "Needs Review" if reasons else "No recorded discrepancy",
             }
         )
-    st.dataframe(rows, width="stretch", hide_index=True)
+    if rows:
+        st.dataframe(rows, width="stretch", hide_index=True)
 
-    for case in cases:
+    for case in filtered_cases:
         reasons = assess_case(case)
         with st.expander(f"{case['case_id']} — Ward {case['ward_number']}"):
             st.write(f"**Site:** {case['site_address'] or 'Not recorded'}")
@@ -3250,8 +3371,12 @@ def render_permit_registry():
 
 
 def render_gps_property_map():
-    st.header("GPS Property Map")
-    st.caption("Search a public place or select a point on the map.")
+    render_page_header(
+        st,
+        "GPS Property Map",
+        "Review recorded property locations and associate cases only after confirming the coordinates.",
+        "Properties · Location records",
+    )
     with st.expander("How to use this map"):
         st.caption(
             "Coordinates are saved only after officer review. OpenStreetMap tiles are not satellite or historical imagery. "
@@ -3318,23 +3443,44 @@ def render_gps_property_map():
         tiles="OpenStreetMap",
         control_scale=True,
     )
+    map_case_records = {
+        (item["case_type"], item["case_id"]): item
+        for item in load_mappable_case_records()
+    }
     for location in locations:
         property_ref = html.escape(location["property_reference"] or "Property")
+        review_status = "No case linked"
+        marker_color = "blue"
+        if location["associated_case_id"]:
+            linked = map_case_records.get(
+                (location["associated_case_type"], location["associated_case_id"])
+            )
+            if linked:
+                review_status = get_review_status(linked["record"])
+                marker_color = {
+                    "Pending Review": "orange",
+                    "Under Investigation": "purple",
+                    "Additional Information Required": "red",
+                    "Verified": "green",
+                    "Resolved": "darkgreen",
+                }.get(review_status, "blue")
         case_text = (
             f"<br>Linked case: {html.escape(location['associated_case_id'])}"
+            f"<br>Review status: {html.escape(review_status)}"
             if location["associated_case_id"]
             else "<br>No case linked"
         )
         popup_html = (
             f"<b>{property_ref}</b><br>Ward: "
             f"{html.escape(str(location['ward_number'] or 'Not recorded'))}"
+            f"<br>Monitoring area: {html.escape(location['monitoring_area'] or 'Not recorded')}"
             f"{case_text}"
         )
         folium.Marker(
             location=(location["latitude"], location["longitude"]),
             tooltip=property_ref,
             popup=folium.Popup(popup_html, max_width=320),
-            icon=folium.Icon(color="blue", icon="home", prefix="fa"),
+            icon=folium.Icon(color=marker_color, icon="home", prefix="fa"),
         ).add_to(property_map)
     if selected_coordinates:
         folium.Marker(
@@ -3352,6 +3498,10 @@ def render_gps_property_map():
         use_container_width=True,
         key=f"gps_property_map_{map_revision}",
         returned_objects=["last_clicked"],
+    )
+    st.caption(
+        "Marker colors show linked review status: orange pending, purple under investigation, "
+        "red information requested, green verified or resolved, blue no linked review status."
     )
     try:
         clicked_coordinates = coordinates_from_map_result(map_result)
@@ -3690,19 +3840,29 @@ if "navigation" not in st.session_state:
     st.session_state["navigation"] = "Dashboard"
 
 st.sidebar.markdown('<div class="sp-brand">SmartPanchayat</div>', unsafe_allow_html=True)
-st.sidebar.markdown('<div class="sp-brand-subtitle">Officer workspace</div>', unsafe_allow_html=True)
+st.sidebar.markdown(
+    '<div class="sp-brand-subtitle">Illegal Construction Monitoring System</div>',
+    unsafe_allow_html=True,
+)
+st.sidebar.markdown(
+    '<div class="sp-sidebar-description">Property records, visual change reviews, and officer follow-up in one workspace.</div>',
+    unsafe_allow_html=True,
+)
 navigation_sections = (
-    ("OVERVIEW", (("Dashboard", "Dashboard"),)),
-    ("CASES", (("Register case", "Register Case"), ("Saved cases", "Saved Cases"))),
-    ("MONITORING", (("Automatic Change Detection", "Change Detection"), ("Historical Imagery", "Historical Imagery"), ("Image comparison", "Image Comparison"))),
-    ("PROPERTIES", (("GPS Property Map", "GPS Property Map"), ("Permit Registry", "Permit Verification"))),
-    ("INVESTIGATION", (("Alert management", "Officer Alerts & Risk"),)),
+    ("OVERVIEW", (("Dashboard", "Dashboard", ":material/dashboard:"),)),
+    ("CASES", (("Register case", "Register Case", ":material/add_box:"), ("Saved cases", "Saved Cases", ":material/folder_open:"))),
+    ("MONITORING", (("Automatic Change Detection", "Automatic Change Detection", ":material/compare:"), ("Image comparison", "Image Comparison", ":material/image_search:"))),
+    ("PROPERTIES", (("GPS Property Map", "GPS Property Map", ":material/location_on:"),)),
+    ("INVESTIGATION", (("Alert management", "Officer Alerts", ":material/notifications_active:"),)),
+    ("SYSTEM", (("About the System", "About the System", ":material/info:"),)),
+    ("ADDITIONAL TOOLS", (("Historical Imagery", "Historical Imagery", ":material/satellite_alt:"), ("Permit Registry", "Permit Registry", ":material/verified_user:"))),
 )
 for section, destinations in navigation_sections:
     st.sidebar.markdown(f'<div class="sp-section-label">{section}</div>', unsafe_allow_html=True)
-    for destination, label in destinations:
+    for destination, label, icon in destinations:
         st.sidebar.button(
             label,
+            icon=icon,
             key=f"navigation_{destination.replace(' ', '_').lower()}",
             type="primary" if st.session_state["navigation"] == destination else "secondary",
             use_container_width=True,
@@ -3732,6 +3892,8 @@ elif page == "Historical Imagery":
     render_historical_imagery()
 elif page == "Permit Registry":
     render_permit_registry()
+elif page == "About the System":
+    render_about_system()
 else:
     render_image_comparison()
 
