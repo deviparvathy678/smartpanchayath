@@ -1,0 +1,21 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Local Python environments
+.venv/
+venv/
+
+# Local database copies, backups, and uploaded evidence
+*.db
+*.db-*
+backups/
+change_images/
+/assets/smartpanchayat_drone_surveillance_demo.mp4
