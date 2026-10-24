@@ -6,7 +6,8 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 
 import cv2
@@ -15,11 +16,15 @@ import numpy as np
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageDraw, UnidentifiedImageError
 from ui_theme import (
     apply_theme,
+    render_dashboard_hero,
+    render_dashboard_case_table,
+    render_dashboard_priority_table,
     render_header,
     render_metric_card,
+    render_page_header,
     render_result_summary,
     render_section_header,
     render_status_badge,
@@ -27,10 +32,13 @@ from ui_theme import (
 )
 from change_detection import (
     ComparisonBlockedError,
+    ComparisonAssessment,
     assess_comparison_inputs,
     DETECTION_METHOD,
     compare_images,
 )
+from image_alignment import AlignmentReport, map_reference_point_to_newer_pixel
+from image_quality import assess_rgb_quality, assess_pair_compatibility
 from imagery_sources import (
     AuthenticationMissing,
     Element84SentinelProvider,
@@ -55,6 +63,30 @@ from evaluation_metrics import (
     evaluation_report_json,
     evaluate_labeled_csv,
     mean_evidence_confidence,
+)
+from aerial_imagery import ImageryUploadError, read_aerial_upload, validate_aerial_pair
+from change_markers import (
+    ChangeMarker,
+    create_or_update_surveillance_task,
+    create_verified_survey_task,
+    create_surveillance_review_request,
+    draw_change_markers,
+    ensure_surveillance_schema,
+    export_task_csv,
+    export_task_geojson,
+    export_task_kml,
+    extract_change_markers,
+    save_demo_imagery_comparison,
+    update_marker_review,
+    upsert_change_markers,
+)
+from auth_store import authenticate, can_manage_surveillance, ensure_auth_schema
+from demo_imagery import (
+    decode_comparison_frame,
+    extract_georeferenced_pixel_location,
+    filter_regions_by_area,
+    inspect_comparison_image,
+    validate_gif_pair,
 )
 
 
@@ -242,6 +274,8 @@ def initialize_database():
         # Append-only investigation history; no historical case rows are rewritten.
         ensure_audit_table(connection)
         ensure_risk_schema(connection)
+        ensure_auth_schema(connection)
+        ensure_surveillance_schema(connection)
 def load_cases():
     with get_connection() as connection:
         return connection.execute(
@@ -793,7 +827,7 @@ def _render_confidence_evaluation_metrics(evidence_confidence=None):
         )
         columns[0].metric(
             "Evidence Confidence",
-            f"{confidence_score}%" if confidence_score is not None else "Not available",
+            f"{confidence_score}%" if confidence_score is not None else "—",
             help=(
                 "Rule-based Evidence Confidence — Not Statistically Validated. It is not model probability, "
                 "detection accuracy, or legal status."
@@ -816,7 +850,7 @@ def _render_confidence_evaluation_metrics(evidence_confidence=None):
         evaluation = st.session_state.get("sp_evaluation_result")
         for column, (label, key) in zip(columns[1:], metric_specs):
             value = evaluation.get(key) if evaluation else None
-            column.metric(label, f"{value:.1%}" if value is not None else "Not evaluated")
+            column.metric(label, f"{value:.1%}" if value is not None else "—")
         if not evaluation or not evaluation.get("sample_count"):
             st.caption("Not evaluated — labeled test data required.")
 
@@ -915,11 +949,23 @@ def render_dashboard():
         for row in image_detections
     )
 
-    st.header("Dashboard")
-    st.caption("Overview of monitored properties and investigations")
+    render_dashboard_hero(
+        st,
+        "Property Change Review",
+        "A municipal workspace for property records, reviewing image changes, and preparing field survey hand-offs.",
+        "SmartPanchayat · Overview",
+    )
     demo_message = st.session_state.pop("demo_cases_message", None)
     if demo_message:
         st.success(demo_message)
+
+    action_columns = st.columns([1, 1, 3])
+    if action_columns[0].button("Register New Case", type="primary", use_container_width=True):
+        _choose_navigation("Register case")
+        st.rerun()
+    if action_columns[1].button("Open GPS Property Map", use_container_width=True):
+        _choose_navigation("GPS Property Map")
+        st.rerun()
 
     risk_records = load_all_risk_assessments()
     risk_counts = {
@@ -931,22 +977,19 @@ def render_dashboard():
     under_review_count = pending_count + investigation_count + additional_info_count
     high_priority_count = risk_counts.get("HIGH PRIORITY", 0) + risk_counts.get("CRITICAL REVIEW", 0)
 
-    metric_rows = [
-        [
-            ("Total Cases", total_count),
-            ("High Priority", high_priority_count),
-            ("Under Review", under_review_count),
-        ],
-        [
-            ("Properties", property_count),
-            ("Permit Checks", permit_awaiting_count),
-            ("Resolved", resolved_count),
-        ],
-    ]
-    for row in metric_rows:
-        metric_cols = st.columns(3)
-        for column, (label, value) in zip(metric_cols, row):
-            column.metric(label, value)
+    summary_columns = st.columns(4)
+    for column, label, value, help_text in zip(
+        summary_columns,
+        ("Total registered cases", "Pending review", "Under investigation", "Resolved"),
+        (total_count, pending_count, investigation_count, resolved_count),
+        (
+            "Construction cases and saved image-change reviews.",
+            "Records awaiting an initial officer review.",
+            "Records currently under investigation.",
+            "Records marked resolved in the review workflow.",
+        ),
+    ):
+        render_metric_card(column, label, value, help_text)
 
     dashboard_confidence = mean_evidence_confidence([
         confidence_from_saved_reports(
@@ -971,7 +1014,6 @@ def render_dashboard():
     )
     st.caption("Investigation priority supports triage; it is not a legal finding.")
 
-    st.subheader("Recent investigations")
     recent_rows = []
     for case in cases:
         risk = load_risk_assessment("construction", case["case_id"])
@@ -982,6 +1024,7 @@ def render_dashboard():
             "Risk": risk["risk_category"] if risk else "Not assessed",
             "Status": get_review_status(case),
             "Date": case["inspection_date"] or "Not recorded",
+            "_key": f"construction|{case['case_id']}",
         })
     for detection in image_detections:
         risk = load_risk_assessment("image_detection", detection["case_id"])
@@ -992,38 +1035,75 @@ def render_dashboard():
             "Risk": risk["risk_category"] if risk else "Not assessed",
             "Status": get_review_status(detection),
             "Date": detection["detection_date"] or detection["created_at"] or "Not recorded",
+            "_key": f"image_detection|{detection['case_id']}",
         })
     recent_rows.sort(key=lambda row: str(row["Date"]), reverse=True)
     content_col, summary_col = st.columns((2.1, 1))
     with content_col:
         if recent_rows:
-            st.dataframe(recent_rows[:8], width="stretch", hide_index=True)
+            latest_rows = recent_rows[:8]
+            st.markdown(
+                '<div class="sp-dashboard-section-title">'
+                '<h3>Recent cases</h3>'
+                f'<span>{len(latest_rows)} latest records</span></div>'
+                '<p class="sp-priority-note">The newest saved construction cases and image-change reviews.</p>',
+                unsafe_allow_html=True,
+            )
+            render_dashboard_case_table(
+                st,
+                [{key: value for key, value in row.items() if key != "_key"} for row in latest_rows],
+            )
+            labels = {
+                f"{row['Case ID']} · {row['Property']} · {row['Status']}": row
+                for row in latest_rows
+            }
+            with st.container(border=True):
+                st.markdown("**Open a case record**")
+                case_select_col, case_action_col = st.columns([4, 1])
+                selected_label = case_select_col.selectbox(
+                    "Select a recent case",
+                    list(labels),
+                    label_visibility="collapsed",
+                    key="dashboard_recent_case",
+                )
+                if case_action_col.button("Open case", key="dashboard_open_case", type="primary", use_container_width=True):
+                    st.session_state["saved_case_search"] = labels[selected_label]["Case ID"]
+                    st.session_state["saved_cases_status_filter"] = "All statuses"
+                    _choose_navigation("Saved cases")
+                    st.rerun()
         else:
-            st.info("No cases have been recorded yet.")
+            st.info("No cases have been recorded yet. Register the first case to begin monitoring.")
+            if st.button("Register the first case", type="primary", key="dashboard_empty_register"):
+                _choose_navigation("Register case")
+                st.rerun()
     with summary_col:
-        st.markdown("#### Investigation summary")
-        st.dataframe(
+        st.markdown(
+            '<div class="sp-dashboard-section-title">'
+            '<h3>Investigation summary</h3><span>Priority mix</span></div>'
+            '<p class="sp-priority-note">Cases grouped by current triage level.</p>',
+            unsafe_allow_html=True,
+        )
+        render_dashboard_priority_table(
+            st,
             [
                 {"Priority": category.title(), "Cases": risk_counts[category]}
                 for category in RISK_CATEGORIES
             ],
-            width="stretch",
-            hide_index=True,
         )
 
-    with st.expander("Additional monitoring and permit metrics"):
-        extra_cols = st.columns(3)
-        extra_cols[0].metric("Potential changes awaiting review", potential_awaiting)
-        extra_cols[1].metric("Permit checks awaiting verification", permit_awaiting_count)
-        extra_cols[2].metric("Expired permit records", expired_permit_count)
-        extra_cols = st.columns(3)
-        extra_cols[0].metric("Manual-upload comparisons", manual_comparisons)
-        extra_cols[1].metric("Retrieved-imagery comparisons", retrieved_comparisons)
-        extra_cols[2].metric("Recorded permit/floor discrepancies", discrepancy_count)
-        st.caption(
-            f"Unverified permits: {permit_unverified_count}. Cases needing permit verification: "
-            f"{cases_needing_permit_check}. Additional information requested: {additional_info_count}."
-        )
+        with st.expander("Additional property and permit metrics"):
+            extra_cols = st.columns(3)
+            extra_cols[0].metric("Potential changes awaiting review", potential_awaiting)
+            extra_cols[1].metric("Permit checks awaiting verification", permit_awaiting_count)
+            extra_cols[2].metric("Expired permit records", expired_permit_count)
+            extra_cols = st.columns(3)
+            extra_cols[0].metric("Manual-upload comparisons", manual_comparisons)
+            extra_cols[1].metric("Retrieved-imagery comparisons", retrieved_comparisons)
+            extra_cols[2].metric("Recorded permit/floor discrepancies", discrepancy_count)
+            st.caption(
+                f"Unverified permits: {permit_unverified_count}. Cases needing permit verification: "
+                f"{cases_needing_permit_check}. Additional information requested: {additional_info_count}."
+            )
 
     with st.expander("About investigation priority"):
         st.caption(
@@ -1043,6 +1123,36 @@ def render_dashboard():
                 "Existing demo IDs were left unchanged."
             )
             st.rerun()
+
+
+def render_about_system():
+    render_page_header(
+        st,
+        "About the System",
+        "A local civic property review prototype for organizing observations and officer follow-up.",
+        "SmartPanchayat · System guide",
+    )
+    left, right = st.columns((1.4, 1))
+    with left:
+        st.subheader("What this prototype supports")
+        st.markdown(
+            "- Construction case registration and review status tracking\n"
+            "- Property location records with officer-selected coordinates\n"
+            "- OpenCV and NumPy comparison of earlier and recent images\n"
+            "- Saved image-change reviews, officer alerts, and local audit history"
+        )
+        st.info(
+            "A visual difference is a review lead. It does not establish illegal construction, "
+            "permit status, or legal compliance."
+        )
+    with right:
+        st.subheader("Data and map notes")
+        st.markdown(
+            "- Case data is stored in the local SQLite database.\n"
+            "- Map coordinates are saved only from entered or selected locations.\n"
+            "- The property map uses OpenStreetMap base tiles; it does not show live satellite imagery.\n"
+            "- This local prototype does not provide authentication or official-government verification."
+        )
 
 
 def render_case_registration():
@@ -1699,6 +1809,9 @@ def render_alert_management():
         update_submitted = st.form_submit_button("Save investigation update")
 
     if update_submitted:
+        if not can_manage_surveillance(st.session_state.get("authenticated_user")):
+            st.error("Only Officers and Admins can change case review status.")
+            return
         if selected_status == "Resolved" and current_status != "Resolved":
             try:
                 validate_resolution_summary(selected_status, resolution_summary)
@@ -1757,18 +1870,21 @@ def render_alert_management():
                             connection, audit_case_type, selected_id, event_type,
                             old_status=old_status, new_status=selected_status,
                             resolution_summary=resolution_summary if selected_status == "Resolved" else None,
+                            actor_identity=st.session_state["authenticated_user"]["username"],
                         )
                     if investigation_note.strip():
                         record_audit_event(
                             connection, audit_case_type, selected_id, "investigation_note_added",
                             old_status=old_status, new_status=selected_status,
                             note=investigation_note,
+                            actor_identity=st.session_state["authenticated_user"]["username"],
                         )
                     if selected_status == "Resolved" and resolution_summary.strip() and old_status == "Resolved":
                         record_audit_event(
                             connection, audit_case_type, selected_id, "resolution_summary_updated",
                             old_status=old_status, new_status=selected_status,
                             resolution_summary=resolution_summary,
+                            actor_identity=st.session_state["authenticated_user"]["username"],
                         )
                     st.success(f"Investigation update for {selected_id} saved.")
         except sqlite3.Error as error:
@@ -1784,6 +1900,34 @@ def _render_saved_image_detections(detections):
         "construction or permit violations. Evidence files remain in the app's "
         "local evidence folder and are not shown as filesystem paths."
     )
+    search_text = st.text_input(
+        "Search image-change cases",
+        placeholder="Case ID, property reference, monitoring area, or ward",
+        key="saved_image_case_search",
+    )
+    status_options = ["All statuses", *REVIEW_STATUSES]
+    status_filter = st.selectbox(
+        "Image-change review status",
+        status_options,
+        key="saved_image_case_status_filter",
+    )
+    query = search_text.strip().casefold()
+    detections = [
+        detection
+        for detection in detections
+        if (status_filter == "All statuses" or detection["review_status"] == status_filter)
+        and (
+            not query
+            or query
+            in " ".join(
+                str(detection[key] or "")
+                for key in ("case_id", "building_reference", "monitoring_area", "ward_number")
+            ).casefold()
+        )
+    ]
+    if not detections:
+        st.info("No image-change cases match these filters.")
+        return
     rows = []
     for detection in detections:
         rows.append(
@@ -1827,7 +1971,12 @@ def _render_saved_image_detections(detections):
 
 
 def render_case_register():
-    st.header("Saved construction cases")
+    render_page_header(
+        st,
+        "Saved Cases",
+        "Search and review the case records currently stored in the local database.",
+        "Cases · Register",
+    )
     cases = load_cases()
     image_detections = load_image_detections()
 
@@ -1842,9 +1991,30 @@ def render_case_register():
         _render_saved_image_detections(image_detections)
         return
 
-    st.caption(f"{len(cases)} case(s) saved in the local SQLite database.")
+    st.caption(f"{len(cases)} construction case(s) saved in the local SQLite database.")
+    search_text = st.text_input(
+        "Search cases",
+        placeholder="Case ID, property reference, address, or ward",
+        key="saved_case_search",
+    )
+    status_options = ["All statuses", *REVIEW_STATUSES]
+    status_filter = st.selectbox("Review status", status_options, key="saved_cases_status_filter")
+    filtered_cases = [
+        case for case in cases
+        if (status_filter == "All statuses" or get_review_status(case) == status_filter)
+        and (
+            not search_text.strip()
+            or search_text.strip().casefold()
+            in " ".join(
+                str(case[key] or "")
+                for key in ("case_id", "building_reference", "site_address", "ward_number")
+            ).casefold()
+        )
+    ]
+    if not filtered_cases:
+        st.info("No construction cases match these filters.")
     rows = []
-    for case in cases:
+    for case in filtered_cases:
         reasons = assess_case(case)
         rows.append(
             {
@@ -1861,9 +2031,10 @@ def render_case_register():
                 "Alert": "Needs Review" if reasons else "No recorded discrepancy",
             }
         )
-    st.dataframe(rows, width="stretch", hide_index=True)
+    if rows:
+        st.dataframe(rows, width="stretch", hide_index=True)
 
-    for case in cases:
+    for case in filtered_cases:
         reasons = assess_case(case)
         with st.expander(f"{case['case_id']} — Ward {case['ward_number']}"):
             st.write(f"**Site:** {case['site_address'] or 'Not recorded'}")
@@ -2010,6 +2181,9 @@ def render_case_register():
         edit_submitted = st.form_submit_button("Save case changes", type="primary")
 
     if edit_submitted:
+        if not can_manage_surveillance(st.session_state.get("authenticated_user")):
+            st.error("Only Officers and Admins can change case review status.")
+            return
         if edit_review_status == "Resolved" and current_review_status != "Resolved":
             try:
                 validate_resolution_summary(edit_review_status, edit_resolution_summary)
@@ -2074,6 +2248,7 @@ def render_case_register():
                                 old_status=old_status,
                                 new_status=edit_review_status,
                                 resolution_summary=edit_resolution_summary if edit_review_status == "Resolved" else None,
+                                actor_identity=st.session_state["authenticated_user"]["username"],
                             )
                         if text_value(previous["permit_status"]) != edit_permit_status:
                             record_audit_event(
@@ -2082,6 +2257,7 @@ def render_case_register():
                                 selected_id,
                                 "recorded_permit_status_changed",
                                 note=f"Recorded status changed from {previous['permit_status']} to {edit_permit_status}.",
+                                actor_identity=st.session_state["authenticated_user"]["username"],
                             )
                         st.success(f"Case {selected_id} was updated.")
             except sqlite3.Error as error:
@@ -2193,6 +2369,23 @@ def _save_evidence_images(earlier_jpeg, newer_jpeg):
         for path in absolute_paths:
             path.unlink(missing_ok=True)
         raise
+
+
+def _save_georeferenced_evidence(file_bytes):
+    """Store an explicitly selected, hash-named GeoTIFF in the existing evidence folder."""
+    digest = hashlib.sha256(file_bytes).hexdigest()
+    filename = f"{digest}_georeferenced.tif"
+    IMAGE_EVIDENCE_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    path = IMAGE_EVIDENCE_DIRECTORY / filename
+    try:
+        with path.open("xb") as target:
+            target.write(file_bytes)
+        created = True
+    except FileExistsError:
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise OSError("An evidence filename collision was detected.")
+        created = False
+    return f"change_images/{filename}", path, created
 
 
 def save_image_detection(metadata, comparison):
@@ -2358,7 +2551,7 @@ def render_historical_imagery():
     locations = load_property_locations()
     if not locations:
         st.warning("No registered property coordinates are available. Record an officer-selected location on GPS Property Map first.")
-        st.caption("If no scene is available or provider access fails, use the existing Automatic Change Detection manual upload workflow.")
+        st.caption("If no scene is available or provider access fails, open Properties to upload a dated before/after pair.")
         return
     by_id = {int(row["location_id"]): row for row in locations}
     location_id = st.selectbox(
@@ -2474,7 +2667,7 @@ def render_historical_imagery():
                         }, ensure_ascii=False),
                     }
                     token = hashlib.sha256((key_raw + str(result.changed_pixel_percentage)).encode()).hexdigest()[:12]
-                    st.session_state["historical_comparison_preview"] = {"metadata": metadata, "comparison": comparison, "result": result, "scenes": chosen, "token": token}
+                    st.session_state["historical_comparison_preview"] = {"metadata": metadata, "comparison": comparison, "result": result, "scenes": chosen, "old_geo": old_geo, "new_geo": new_geo, "token": token}
                 except (ImageryProviderError, ValueError, OSError, cv2.error) as error:
                     st.error(f"Historical comparison could not be completed: {error}")
 
@@ -2512,14 +2705,69 @@ def render_historical_imagery():
         for warning in result.warnings:
             st.warning(warning)
         st.warning("The score is not the percentage of new construction and does not establish a permit discrepancy.")
-        if st.button("Send to Automatic Change Detection for officer review", type="primary", key="history_send_to_review"):
-            st.session_state["automatic_change_preview"] = preview
-            st.session_state["navigation"] = "Automatic Change Detection"
+        actor = st.session_state.get("authenticated_user", {})
+        if can_manage_surveillance(actor) and st.button("Save selected images and red markers to Properties", type="primary", key="history_save_property_pair"):
+            try:
+                old_geo, new_geo = preview["old_geo"], preview["new_geo"]
+                markers = extract_change_markers(
+                    result.mask, comparison_key=meta["comparison_key"], minimum_region_pixels=64,
+                    transform=old_geo.transform, crs=old_geo.crs,
+                    image_bounds_wgs84=old_geo.bbox_wgs84,
+                    property_point=(location["latitude"], location["longitude"]),
+                )
+                with get_connection() as connection:
+                    existing = connection.execute(
+                        "SELECT image_refs_json FROM property_imagery_pairs WHERE comparison_key = ?",
+                        (meta["comparison_key"],),
+                    ).fetchone()
+                if existing:
+                    refs = json.loads(existing["image_refs_json"])
+                else:
+                    references, _ = _save_evidence_images(
+                        _encode_evidence_image(comparison.earlier_rgb),
+                        _encode_evidence_image(comparison.newer_rgb),
+                    )
+                    refs = {
+                        "before": references[0], "after": references[1],
+                        "before_date": old_geo.acquisition_date.isoformat(), "after_date": new_geo.acquisition_date.isoformat(),
+                        "before_source": old_geo.source, "after_source": new_geo.source,
+                        "before_resolution_m": old_geo.resolution_m, "after_resolution_m": new_geo.resolution_m,
+                        "before_crs": old_geo.crs, "after_crs": new_geo.crs,
+                        "before_valid_pct": result.valid_pixel_percentage, "after_valid_pct": result.valid_pixel_percentage,
+                        "before_cloud_pct": result.cloud_percentage, "after_cloud_pct": result.cloud_percentage,
+                        "before_scene_id": old_geo.scene_id, "after_scene_id": new_geo.scene_id,
+                    }
+                quality = {
+                    "earlier": result.earlier_quality.as_dict() if result.earlier_quality else None,
+                    "newer": result.newer_quality.as_dict() if result.newer_quality else None,
+                    "valid_pixel_percentage": result.valid_pixel_percentage,
+                    "cloud_percentage": result.cloud_percentage,
+                    "warnings": result.warnings,
+                }
+                with get_connection() as connection:
+                    upsert_change_markers(
+                        connection, meta["comparison_key"], location_id,
+                        location["associated_case_id"], markers, method=result.method,
+                        parameters={"minimum_region_pixels": 64, "provider": "Element84 Earth Search Sentinel-2 L2A"},
+                        image_refs=refs, quality_report=quality, actor_identity=actor["username"],
+                    )
+                    record_audit_event(
+                        connection, location["associated_case_type"] or "image_detection",
+                        location["associated_case_id"] or meta["comparison_key"],
+                        "retrieved_property_imagery_saved",
+                        note=f"Saved selected Sentinel-2 scenes for property {location['property_reference']}; {len(markers)} potential regions retained.",
+                        actor_identity=actor["username"],
+                    )
+                st.success("Selected before/after imagery and its red markers were saved to this property.")
+            except (ValueError, OSError, sqlite3.Error) as error:
+                st.error(f"Retrieved images could not be saved to Properties: {error}")
+        if st.button("Open Properties for officer review", type="primary", key="history_send_to_review"):
+            st.session_state["navigation"] = "GPS Property Map"
             st.rerun()
     st.divider()
-    st.caption("Fallback: existing manual-upload comparison remains available when no suitable public scenes can be retrieved.")
-    if st.button("Open manual upload comparison", key="history_manual_fallback"):
-        st.session_state["navigation"] = "Automatic Change Detection"
+    st.caption("Fallback: upload a before/after pair in Properties when no suitable public scenes can be retrieved.")
+    if st.button("Open Properties for manual upload", key="history_manual_fallback"):
+        st.session_state["navigation"] = "GPS Property Map"
         st.rerun()
 
 
@@ -3249,320 +3497,1054 @@ def render_permit_registry():
         st.info("No local permit records are stored. Permit status not verified; this does not mean that no permit exists.")
 
 
+def _build_demo_forest_scene(*, construction=False):
+    """Create a synthetic teaching illustration; never use it for location extraction."""
+    width, height = 760, 390
+    rng = np.random.default_rng(19)
+    pixels = np.zeros((height, width, 3), dtype=np.uint8)
+    pixels[:, :, 0] = rng.integers(31, 61, size=(height, width), dtype=np.uint8)
+    pixels[:, :, 1] = rng.integers(78, 123, size=(height, width), dtype=np.uint8)
+    pixels[:, :, 2] = rng.integers(37, 70, size=(height, width), dtype=np.uint8)
+    scene = Image.fromarray(pixels, "RGB")
+    draw = ImageDraw.Draw(scene, "RGBA")
+
+    # Repeating canopy clusters make the forest texture clearly illustrative.
+    for row, y in enumerate(range(22, height, 43)):
+        for col, x in enumerate(range(22 + (row % 2) * 18, width, 44)):
+            radius = 13 + ((row * 7 + col * 3) % 8)
+            shade = (24 + (row * 11 + col * 5) % 25, 76 + (row * 7 + col * 9) % 43, 30 + (row * 3 + col * 4) % 19, 235)
+            draw.ellipse((x-radius, y-radius, x+radius, y+radius), fill=shade)
+            draw.ellipse((x-radius//2, y-radius//2, x+radius//2, y+radius//2), fill=(87, 128, 54, 145))
+
+    if construction:
+        draw.polygon([(270, 120), (493, 103), (548, 285), (308, 310)], fill=(143, 128, 92, 245))
+        draw.polygon([(323, 142), (387, 135), (400, 208), (337, 215)], fill=(194, 183, 150, 255), outline=(80, 77, 62, 255), width=3)
+        draw.polygon([(337, 135), (362, 112), (392, 131), (387, 142)], fill=(88, 76, 65, 255))
+        draw.polygon([(424, 175), (488, 169), (501, 243), (436, 250)], fill=(175, 163, 132, 255), outline=(80, 77, 62, 255), width=3)
+        draw.polygon([(424, 175), (450, 151), (480, 170), (466, 182)], fill=(88, 76, 65, 255))
+        draw.line([(20, 333), (250, 320), (730, 340)], fill=(167, 153, 119, 220), width=13)
+        draw.ellipse((294, 99, 525, 272), outline=(255, 48, 48, 255), width=9)
+        draw.ellipse((394, 178, 414, 198), fill=(255, 48, 48, 255))
+    return scene
+
+
 def render_gps_property_map():
-    st.header("GPS Property Map")
-    st.caption("Search a public place or select a point on the map.")
-    with st.expander("How to use this map"):
-        st.caption(
-            "Coordinates are saved only after officer review. OpenStreetMap tiles are not satellite or historical imagery. "
-            "Search requires an internet connection."
-        )
-    st.caption(
-        "Map tiles © OpenStreetMap contributors. Location search is sent to "
-        "OpenStreetMap Nominatim; use a public place or landmark, not private "
-        "personal information. Search and map tiles require an internet connection."
+    render_page_header(
+        st,
+        "Satellite Imagery Comparison & Surveillance",
+        "Review earlier and later images, confirm potential changes, and prepare a verified survey hand-off.",
+        "Properties · Imagery comparison",
+    )
+    demo_warning = (
+        "DEMO MODE — Imagery is not georeferenced. Location unverified. Not evidence."
+    )
+    st.warning(
+        "DEMO MODE — These are externally created demonstration GIFs, not verified satellite imagery. "
+        "Image pixels do not establish a property's location, distances, building dimensions, or land area."
     )
 
-    with st.form("gps_location_search"):
-        search_query = st.text_input(
-            "Search location (public place or landmark)", max_chars=200
+    with st.container(border=True):
+        st.subheader("Satellite Change Detection \u2014 Demo & Drone Survey")
+        st.caption("Synthetic illustration for explaining the workflow. It is not satellite imagery and has no geographic reference.")
+        demo_before, demo_after = st.columns(2)
+        demo_before.image(
+            _build_demo_forest_scene(),
+            caption="BEFORE - Forest / Earlier Image - Demo date",
+            width="stretch",
         )
-        search_submitted = st.form_submit_button("Search map")
-    if search_submitted:
-        query = search_query.strip()
-        if not query:
-            st.error("Enter a public place or landmark to search for.")
-        else:
-            try:
-                matches = search_public_location(query)
-                st.session_state["gps_location_search_results"] = matches
-                if not matches:
-                    st.info("No matching public place was found. You can click the map manually.")
-            except requests.RequestException as error:
-                st.session_state["gps_location_search_results"] = []
-                st.error(f"Location search is unavailable: {error}")
-            except (ValueError, TypeError) as error:
-                st.session_state["gps_location_search_results"] = []
-                st.error(f"Location results could not be read: {error}")
+        demo_after.image(
+            _build_demo_forest_scene(construction=True),
+            caption="AFTER - Potential New Construction - red marker - Demo date",
+            width="stretch",
+        )
+        slide_steps = st.columns(3)
+        slide_steps[0].markdown("**1 - Compare**  \nReview selected BEFORE and AFTER frames.")
+        slide_steps[1].markdown("**2 - Confirm**  \nAn Officer/Admin reviews the possible-change region.")
+        slide_steps[2].markdown("**3 - Prepare survey**  \nReview a verified location and save a human hand-off for later.")
+        st.info("No coordinates are shown or inferred by this example. A red mark indicates only an illustrative visual candidate.")
+        st.markdown("### Drone surveillance demo video")
+        st.caption("Demonstration playback only. It does not connect to or control a drone.")
+        st.video(str(Path(__file__).with_name("assets") / "smartpanchayat_drone_surveillance_demo_h264.mp4"))
 
-    search_results = st.session_state.get("gps_location_search_results", [])
-    if search_results:
-        result_labels = [item["label"] for item in search_results]
-        chosen_result = st.selectbox("Search results", result_labels)
-        if st.button("Center map on selected result"):
-            item = search_results[result_labels.index(chosen_result)]
-            set_selected_map_coordinates((item["latitude"], item["longitude"]))
-            st.session_state["gps_map_revision"] = (
-                st.session_state.get("gps_map_revision", 0) + 1
-            )
-            st.rerun()
-
-    selected_coordinates = st.session_state.get("gps_selected_coordinates")
     locations = load_property_locations()
-    if selected_coordinates:
-        center = selected_coordinates
-        zoom = 17
-    elif locations:
-        center = (
-            sum(row["latitude"] for row in locations) / len(locations),
-            sum(row["longitude"] for row in locations) / len(locations),
-        )
-        zoom = 11
-    else:
-        # A neutral world view, not an assumed Panchayat/property coordinate.
-        center, zoom = (0.0, 0.0), 2
-
-    property_map = folium.Map(
-        location=center,
-        zoom_start=zoom,
-        tiles="OpenStreetMap",
-        control_scale=True,
+    location_by_id = {int(row["location_id"]): row for row in locations}
+    location_choices = [None, *location_by_id]
+    selected_location_id = st.selectbox(
+        "Registered property (optional for comparison)",
+        location_choices,
+        format_func=lambda key: "Unlinked demo comparison" if key is None else (
+            f"{location_by_id[key]['property_reference']} · "
+            f"{location_by_id[key]['verification_status']} location"
+        ),
+        key="demo_comparison_property",
     )
-    for location in locations:
-        property_ref = html.escape(location["property_reference"] or "Property")
-        case_text = (
-            f"<br>Linked case: {html.escape(location['associated_case_id'])}"
-            if location["associated_case_id"]
-            else "<br>No case linked"
-        )
-        popup_html = (
-            f"<b>{property_ref}</b><br>Ward: "
-            f"{html.escape(str(location['ward_number'] or 'Not recorded'))}"
-            f"{case_text}"
-        )
-        folium.Marker(
-            location=(location["latitude"], location["longitude"]),
-            tooltip=property_ref,
-            popup=folium.Popup(popup_html, max_width=320),
-            icon=folium.Icon(color="blue", icon="home", prefix="fa"),
-        ).add_to(property_map)
-    if selected_coordinates:
-        folium.Marker(
-            location=selected_coordinates,
-            tooltip="Selected property point (not saved yet)",
-            popup="Officer-selected point — save only after verifying the location.",
-            icon=folium.Icon(color="red", icon="map-marker", prefix="fa"),
-        ).add_to(property_map)
-
-    st.markdown("**Click the map to choose a property point.**")
-    map_revision = st.session_state.get("gps_map_revision", 0)
-    map_result = st_folium(
-        property_map,
-        height=500,
-        use_container_width=True,
-        key=f"gps_property_map_{map_revision}",
-        returned_objects=["last_clicked"],
+    selected_location = location_by_id.get(selected_location_id)
+    cases = load_mappable_case_records()
+    case_by_id = {item["case_id"]: item for item in cases}
+    default_case = (
+        selected_location["associated_case_id"]
+        if selected_location and selected_location["associated_case_id"] in case_by_id else None
     )
-    try:
-        clicked_coordinates = coordinates_from_map_result(map_result)
-        if (
-            clicked_coordinates is not None
-            and clicked_coordinates
-            != st.session_state.get("gps_selected_coordinates")
-        ):
-            set_selected_map_coordinates(clicked_coordinates)
-            st.rerun()
-    except ValueError:
-        st.warning("The map returned invalid coordinates; select another point.")
-
-    selected_coordinates = st.session_state.get("gps_selected_coordinates")
-    if selected_coordinates:
-        st.success(
-            f"Selected point: latitude {selected_coordinates[0]:.6f}, "
-            f"longitude {selected_coordinates[1]:.6f}"
-        )
-    else:
-        st.caption("No point selected. Search or click the map; no coordinates are assumed.")
-
-    case_records = load_mappable_case_records()
-    case_by_key = {
-        f"{item['case_type']}:{item['case_id']}": item for item in case_records
-    }
-    choices = {"none": "No associated case"}
-    for key, item in case_by_key.items():
-        choices[key] = item["label"]
-
-    if "gps_latitude_input" not in st.session_state:
-        st.session_state["gps_latitude_input"] = (
-            selected_coordinates[0] if selected_coordinates else None
-        )
-    if "gps_longitude_input" not in st.session_state:
-        st.session_state["gps_longitude_input"] = (
-            selected_coordinates[1] if selected_coordinates else None
+    case_choices = [None, *case_by_id]
+    selected_case_id = st.selectbox(
+        "Related case (optional for comparison)",
+        case_choices,
+        index=case_choices.index(default_case),
+        format_func=lambda key: "No case linked" if key is None else case_by_id[key]["label"],
+        key="demo_comparison_case",
+    )
+    if selected_location and selected_location["verification_status"] != "Verified":
+        st.info(
+            "The registered property location is not verified. A review request can be created, "
+            "but location-based field surveillance must wait until an authorized officer verifies its coordinates."
         )
 
-    with st.form("save_gps_property_location"):
-        st.subheader("Record this property location")
-        property_reference = st.text_input(
-            "Property reference *", max_chars=120
-        )
-        monitoring_area = st.text_input("Monitoring-area name *", max_chars=120)
-        ward_text = st.text_input("Ward number (optional)", max_chars=8)
-        coordinate_column, longitude_column = st.columns(2)
-        with coordinate_column:
-            latitude_value = st.number_input(
-                "Latitude *",
-                min_value=-90.0,
-                max_value=90.0,
-                step=0.000001,
-                format="%.6f",
-                key="gps_latitude_input",
+    upload_revision = int(st.session_state.get("demo_gif_upload_revision", 0))
+    st.markdown("### Stage 1 - BEFORE satellite image")
+    before_col, after_col = st.columns(2)
+    upload_data = []
+    for column, side, title in (
+        (before_col, "before", "BEFORE IMAGE"),
+        (after_col, "after", "AFTER IMAGE"),
+    ):
+        with column.container(border=True):
+            column.markdown(f"### {title}")
+            upload = column.file_uploader(
+                f"Upload {side} satellite image",
+                type=["gif", "png", "jpg", "jpeg"],
+                accept_multiple_files=False,
+                key=f"demo_{side}_gif_upload_{upload_revision}",
+                help="GIF, PNG, JPG, or JPEG; maximum 10 MB and 20 million pixels per frame. GIFs may contain up to 200 frames.",
             )
-        with longitude_column:
-            longitude_value = st.number_input(
-                "Longitude *",
-                min_value=-180.0,
-                max_value=180.0,
-                step=0.000001,
-                format="%.6f",
-                key="gps_longitude_input",
+            known_date = column.checkbox(
+                f"{side.title()} acquisition date is known",
+                key=f"demo_{side}_date_known",
             )
-        associated_key = st.selectbox(
-            "Associate an existing case (optional)",
-            list(choices),
-            format_func=lambda value: choices[value],
-        )
-        verification_status = st.selectbox(
-            "Location verification", ("Unverified", "Verified"),
-            help="Choose Verified only when coordinates were checked against an authorised source.",
-        )
-        verification_evidence = st.text_input(
-            "Verification source (required if Verified)", max_chars=240
-        )
-        save_submitted = st.form_submit_button("Save property location", type="primary")
-
-    if save_submitted:
-        clean_reference = property_reference.strip()
-        clean_area = monitoring_area.strip()
-        errors = []
-        if not clean_reference:
-            errors.append("Property reference is required.")
-        if not clean_area:
-            errors.append("Monitoring-area name is required.")
-        ward_number = None
-        if ward_text.strip():
+            acquisition_date = (
+                column.date_input(
+                    f"{side.title()} acquisition date",
+                    value=date.today(),
+                    key=f"demo_{side}_date",
+                ).isoformat()
+                if known_date else None
+            )
+        info = None
+        selected_frame = 1
+        rgb = None
+        if upload is not None:
             try:
-                ward_number = int(ward_text.strip())
-                if not 1 <= ward_number <= 1000:
-                    raise ValueError
-            except ValueError:
-                errors.append("Ward number must be a whole number from 1 to 1000.")
+                payload = upload.getvalue()
+                info = inspect_comparison_image(payload, upload.name)
+                with column:
+                    if info.frame_count > 1:
+                        selected_frame = st.slider(
+                            f"{side.title()} frame to preview",
+                            min_value=1,
+                            max_value=info.frame_count,
+                            value=1,
+                            key=f"demo_{side}_frame_{upload_revision}",
+                        )
+                    rgb = decode_comparison_frame(payload, upload.name, selected_frame - 1)
+                    st.image(
+                        rgb,
+                        caption=f"{side.title()} · frame {selected_frame} of {info.frame_count}",
+                        alt=f"Selected {side} demo GIF frame",
+                        width="stretch",
+                    )
+                    cols = st.columns(3)
+                    cols[0].metric("Dimensions", f"{info.width} × {info.height}")
+                    cols[1].metric("Frame", f"{selected_frame} / {info.frame_count}")
+                    cols[2].metric("Date", acquisition_date or "Date unknown")
+                    st.caption(f"{upload.name} · {len(payload) / 1024:.1f} KB · DEMO MODE")
+            except (ValueError, OSError) as error:
+                with column:
+                    st.error(f"{side.title()} image could not be previewed: {error}")
+        upload_data.append({
+            "upload": upload, "info": info, "rgb": rgb,
+            "frame": selected_frame, "date": acquisition_date,
+            "payload": upload.getvalue() if upload is not None and info is not None else None,
+        })
+
+    st.markdown("### Stage 2 - AFTER image and comparison")
+
+    minimum_area = st.number_input(
+        "Minimum difference region size (pixels)",
+        min_value=16,
+        max_value=20_000,
+        value=64,
+        step=16,
+        help="Connected visual-difference regions below this pixel count are filtered out.",
+        key="demo_minimum_region_pixels",
+    )
+    before, after = upload_data
+    ready = before["info"] is not None and after["info"] is not None
+    current_signature = None
+    if ready:
+        current_signature = hashlib.sha256(json.dumps({
+            "property": selected_location_id,
+            "case": selected_case_id,
+            "before_sha256": hashlib.sha256(before["payload"]).hexdigest(),
+            "after_sha256": hashlib.sha256(after["payload"]).hexdigest(),
+            "before_frame": before["frame"], "after_frame": after["frame"],
+            "before_date": before["date"], "after_date": after["date"],
+            "minimum_region_pixels": int(minimum_area),
+        }, sort_keys=True).encode("utf-8")).hexdigest()
+
+    if st.button("Compare Images", type="primary", disabled=not ready, key="demo_compare_images"):
         try:
-            latitude_value, longitude_value = validate_coordinates(
-                latitude_value, longitude_value
+            validate_gif_pair(before["info"], after["info"])
+            old_png = _png_bytes(before["rgb"])
+            new_png = _png_bytes(after["rgb"])
+            assessment = assess_comparison_inputs(old_png, new_png)
+            if not assessment.ready:
+                raise ValueError(assessment.reason or "Image quality or alignment checks blocked comparison.")
+            comparison = compare_images(old_png, new_png, assessment=assessment)
+            filtered_mask = filter_regions_by_area(comparison.mask, int(minimum_area))
+            valid_pixels = max(1, int(np.count_nonzero(comparison.assessment.alignment.valid_mask)))
+            changed_pixels = int(np.count_nonzero(filtered_mask))
+            score = changed_pixels / valid_pixels * 100
+            before_hash = hashlib.sha256(before["payload"]).hexdigest()
+            after_hash = hashlib.sha256(after["payload"]).hexdigest()
+            comparison_key = hashlib.sha256(
+                f"demo-gif:{selected_location_id}:{selected_case_id}:{before_hash}:{after_hash}:"
+                f"{before['frame']}:{after['frame']}:{before['date']}:{after['date']}:{int(minimum_area)}"
+                .encode("utf-8")
+            ).hexdigest()
+            markers = extract_change_markers(
+                filtered_mask,
+                comparison_key=comparison_key,
+                minimum_region_pixels=int(minimum_area),
             )
-        except ValueError as error:
-            errors.append(str(error))
-        selected_case = case_by_key.get(associated_key)
-        if associated_key != "none" and selected_case is None:
-            errors.append("Select a valid existing case or leave the case unassociated.")
-
-        if errors:
-            for error in errors:
-                st.error(error)
-        else:
+            before_jpeg, after_jpeg = (
+                _encode_evidence_image(before["rgb"]),
+                _encode_evidence_image(after["rgb"]),
+            )
+            refs, saved_paths = _save_evidence_images(before_jpeg, after_jpeg)
+            image_refs = {
+                "before": refs[0], "after": refs[1],
+                "before_filename": before["upload"].name,
+                "after_filename": after["upload"].name,
+                "before_source": f"Officer upload ({before['info'].image_format})",
+                "after_source": f"Officer upload ({after['info'].image_format})",
+                "before_date": before["date"] or "Date unknown",
+                "after_date": after["date"] or "Date unknown",
+                "before_frame": before["frame"], "after_frame": after["frame"],
+                "mode": "DEMO MODE; not georeferenced",
+            }
+            quality = json.loads(_comparison_quality_json(assessment))
             try:
-                save_property_location(
-                    clean_reference,
-                    latitude_value,
-                    longitude_value,
-                    ward_number,
-                    clean_area,
-                    selected_case["case_id"] if selected_case else None,
-                    selected_case["case_type"] if selected_case else None,
-                    verification_status,
-                    verification_evidence,
-                )
-                st.session_state["gps_selected_coordinates"] = (
-                    latitude_value,
-                    longitude_value,
-                )
-                st.success(f"Property location for {clean_reference} was saved.")
-                st.rerun()
-            except sqlite3.IntegrityError:
-                st.error(
-                    "That property reference already has a saved map location. "
-                    "No existing location was overwritten."
-                )
-            except ValueError as error:
-                st.error(str(error))
-            except sqlite3.Error as error:
-                st.error(f"The property location could not be saved: {error}")
+                with get_connection() as connection:
+                    save_demo_imagery_comparison(
+                        connection,
+                        comparison_key=comparison_key,
+                        property_location_id=selected_location_id,
+                        case_id=selected_case_id,
+                        before_date=before["date"], after_date=after["date"],
+                        before_frame=before["frame"], after_frame=after["frame"],
+                        before_sha256=before_hash, after_sha256=after_hash,
+                        image_refs=image_refs,
+                        parameters={
+                            "method": DETECTION_METHOD,
+                            "minimum_region_pixels": int(minimum_area),
+                            "alignment": comparison.alignment_note,
+                            "demo_mode": True,
+                        },
+                        quality_report=quality,
+                        changed_pixel_percentage=score,
+                        changed_pixel_count=changed_pixels,
+                        markers=markers,
+                        actor_identity=st.session_state["authenticated_user"]["username"],
+                    )
+            except Exception:
+                for saved_path in saved_paths:
+                    saved_path.unlink(missing_ok=True)
+                raise
+            st.session_state["demo_imagery_comparison_result"] = {
+                "signature": current_signature,
+                "comparison_key": comparison_key,
+                "markers": len(markers),
+                "score": score,
+                "pixel_count": changed_pixels,
+                "newer_to_reference_matrix": (
+                    comparison.assessment.alignment.newer_to_reference_matrix.tolist()
+                    if comparison.assessment.alignment.newer_to_reference_matrix is not None
+                    else None
+                ),
+                "quality_status": assessment.status,
+                "quality_warnings": list(assessment.warnings),
+                "before_date": before["date"] or "Date unknown",
+                "after_date": after["date"] or "Date unknown",
+                "before_frame": before["frame"], "after_frame": after["frame"],
+            }
+            st.rerun()
+        except (ValueError, OSError, sqlite3.Error, cv2.error) as error:
+            st.error(f"Image comparison could not be completed: {error}")
+
+    result = st.session_state.get("demo_imagery_comparison_result")
+    if not result or result.get("signature") != current_signature:
+        if result:
+            st.info("The selected image, frame, date, property, case, or threshold changed. Compare again to refresh the results.")
+        return
 
     st.divider()
-    st.subheader("Saved property locations")
-    locations = load_property_locations()
-    if locations:
-        st.dataframe(
-            [
-                {
-                    "Property reference": row["property_reference"],
-                    "Ward": row["ward_number"] or "Not recorded",
-                    "Monitoring area": row["monitoring_area"],
-                    "Latitude": f"{row['latitude']:.6f}",
-                    "Longitude": f"{row['longitude']:.6f}",
-                    "Location verification": row["verification_status"] or "Unverified",
-                    "Associated case": row["associated_case_id"] or "Not linked",
-                }
-                for row in locations
-            ],
-            width="stretch",
-            hide_index=True,
-        )
-    else:
-        st.info("No property locations have been recorded yet.")
+    st.subheader("Comparison results")
+    st.markdown("**Potential Construction Change — Verification Required**")
+    st.caption(f"Comparison status: {result['quality_status']}")
+    st.warning(demo_warning)
+    st.info("Permit status not verified.")
+    for warning in result["quality_warnings"]:
+        st.warning(warning)
+    st.caption(
+        f"Frames: BEFORE {result['before_frame']} · {result['before_date']} | "
+        f"AFTER {result['after_frame']} · {result['after_date']}"
+    )
+    metrics = st.columns(3)
+    metrics[0].metric("Difference regions", str(result["markers"]))
+    metrics[1].metric("Pixel-difference score", f"{result['score']:.2f}%")
+    metrics[2].metric("Changed pixels", f"{result['pixel_count']:,}")
+    st.caption("Score is the percentage of valid aligned pixels retained in the filtered difference mask. It is a visual heuristic, not a probability or legal finding.")
+    if result["markers"] == 0:
+        st.info("No significant difference detected. This does not prove that no construction occurred.")
+    st.caption("Difference regions are visual screening results, not confirmed buildings. Shadows, lighting, vegetation, image alignment, or editing can cause differences.")
 
-    linked_keys = {
-        (row["associated_case_type"], row["associated_case_id"])
-        for row in locations
-        if row["associated_case_id"]
-    }
-    linked_records = [
-        item
-        for item in case_records
-        if (item["case_type"], item["case_id"]) in linked_keys
-    ]
-    if linked_records:
-        with st.expander("Open an associated case"):
-            linked_labels = {item["label"]: item for item in linked_records}
-            selected_label = st.selectbox(
-                "Linked case", list(linked_labels), key="gps_open_linked_case"
+    with get_connection() as connection:
+        marker_rows = connection.execute(
+            "SELECT * FROM change_markers WHERE comparison_key = ? ORDER BY marker_number",
+            (result["comparison_key"],),
+        ).fetchall()
+        requests = connection.execute(
+            "SELECT * FROM surveillance_review_requests WHERE comparison_key = ?",
+            (result["comparison_key"],),
+        ).fetchall()
+    request_by_marker = {row["marker_key"]: row for row in requests}
+    if marker_rows:
+        display_markers = [
+            ChangeMarker(
+                row["marker_key"], row["marker_number"], row["pixel_x"], row["pixel_y"],
+                row["pixel_radius"], row["region_pixels"], row["latitude"], row["longitude"],
+                row["radius_m"], row["area_sqm"],
             )
-            _render_associated_case(linked_labels[selected_label])
-
-    mapped_keys = {
-        (row["associated_case_type"], row["associated_case_id"])
-        for row in locations
-        if row["associated_case_id"]
-    }
-    unmapped_records = [
-        item
-        for item in case_records
-        if (item["case_type"], item["case_id"]) not in mapped_keys
-    ]
-    st.subheader("Existing cases without mapped coordinates")
-    if unmapped_records:
-        st.caption("These records remain unmapped; no coordinates have been inferred for them.")
-        st.dataframe(
-            [
-                {
-                    "Case ID": item["case_id"],
-                    "Record type": (
-                        "Construction case"
-                        if item["case_type"] == "construction"
-                        else "Image-change review"
-                    ),
-                    "Property reference": item["record"]["building_reference"]
-                    or item["record"].get("monitoring_area", "Not recorded"),
-                    "Ward": item["record"]["ward_number"] or "Not recorded",
-                }
-                for item in unmapped_records
-            ],
+            for row in marker_rows
+        ]
+        marked_after_rgb = draw_change_markers(after["rgb"], display_markers)
+        before_image, after_image = st.columns(2)
+        before_image.image(
+            before["rgb"],
+            caption=f"BEFORE - Forest / Earlier Image - {result['before_date']} - Officer upload: {before['upload'].name} - frame {result['before_frame']}",
             width="stretch",
-            hide_index=True,
         )
+        after_image.image(
+            marked_after_rgb,
+            caption=f"AFTER - Potential New Construction - {result['after_date']} - Officer upload: {after['upload'].name} - frame {result['after_frame']}",
+            width="stretch",
+        )
+    if marker_rows:
+        st.markdown("**Numbered regions for officer review**")
+        reviewer = st.session_state.get("authenticated_user", {})
+        for marker in marker_rows:
+            with st.container(border=True):
+                st.markdown(f"### Region {marker['marker_number']}")
+                st.caption(
+                    f"Pixel center ({marker['pixel_x']:.1f}, {marker['pixel_y']:.1f}) · "
+                    f"{marker['region_pixels']:,} difference pixels · {marker['review_status']}"
+                )
+                if can_manage_surveillance(reviewer):
+                    review_choices = (
+                        "Confirm potential construction change", "Dismiss", "Uncertain",
+                    )
+                    current_review = {
+                        "Confirmed for surveillance": review_choices[0],
+                        "Dismissed": review_choices[1],
+                        "Uncertain": review_choices[2],
+                    }.get(marker["review_status"], review_choices[2])
+                    decision = st.segmented_control(
+                        f"Review region {marker['marker_number']}",
+                        review_choices,
+                        default=current_review,
+                        key=f"demo_marker_decision_{marker['marker_key']}",
+                    )
+                    reason = st.text_input(
+                        f"Reason for region {marker['marker_number']} decision",
+                        value=marker["review_reason"] or "",
+                        key=f"demo_marker_reason_{marker['marker_key']}",
+                    )
+                    if st.button("Save officer review", key=f"demo_marker_save_{marker['marker_key']}"):
+                        status = {
+                            review_choices[0]: "Confirmed for surveillance",
+                            review_choices[1]: "Dismissed",
+                            review_choices[2]: "Uncertain",
+                        }[decision]
+                        try:
+                            with get_connection() as connection:
+                                update_marker_review(
+                                    connection, marker["marker_key"], status, reason,
+                                    reviewer["username"],
+                                )
+                            st.success("Officer review saved with its reason, identity, and audit timestamp.")
+                            st.rerun()
+                        except ValueError as error:
+                            st.error(str(error))
+                else:
+                    st.caption("Only an Officer or Admin can review a region.")
+                current_row = marker
+                if can_manage_surveillance(reviewer) and marker["review_status"] == "Confirmed for surveillance":
+                    st.caption("A confirmed visual difference still does not establish illegal construction.")
+                    existing_request = request_by_marker.get(marker["marker_key"])
+                    if existing_request:
+                        st.success(
+                            f"Surveillance review {existing_request['request_id']} · "
+                            f"{existing_request['task_status']} · requested by {existing_request['requested_by']}"
+                        )
+                    elif selected_location_id is None or selected_case_id is None:
+                        st.info("Select a registered property and related case above before creating the surveillance review request.")
+                    else:
+                        if selected_location["verification_status"] != "Verified":
+                            st.warning("The review request will remain pending. Location-based field surveillance cannot be planned until an authorized officer verifies the property coordinates.")
+                        st.caption("This creates a review request only. It does not provide map coordinates, schedule a flight, or command a drone.")
+                        if st.button("Send for Further Surveillance", type="primary", key=f"demo_send_surveillance_{marker['marker_key']}"):
+                            try:
+                                with get_connection() as connection:
+                                    request, created = create_surveillance_review_request(
+                                        connection,
+                                        marker["marker_key"],
+                                        property_location_id=selected_location_id,
+                                        case_id=selected_case_id,
+                                        actor_identity=reviewer["username"],
+                                    )
+                                message = "created" if created else "already exists"
+                                st.success(
+                                    f"Surveillance review {request['request_id']} {message}: "
+                                    f"{request['task_status']}. No flight was authorized or commanded."
+                                )
+                                st.rerun()
+                            except ValueError as error:
+                                st.error(str(error))
+
+        confirmed_markers = [
+            marker for marker in marker_rows
+            if marker["review_status"] == "Confirmed for surveillance"
+        ]
+        if confirmed_markers and can_manage_surveillance(reviewer):
+            marker_by_key = {row["marker_key"]: row for row in confirmed_markers}
+            confirmed_keys = list(marker_by_key)
+            def _confirmed_region_label(key):
+                selected = marker_by_key[key]
+                matrix = result.get("newer_to_reference_matrix")
+                if matrix is None:
+                    return f"Region {selected['marker_number']} · AFTER pixel mapping unavailable"
+                try:
+                    px, py = map_reference_point_to_newer_pixel(
+                        matrix, selected["pixel_x"], selected["pixel_y"]
+                    )
+                    return f"Region {selected['marker_number']} · AFTER pixel ({px:.1f}, {py:.1f})"
+                except ValueError:
+                    return f"Region {selected['marker_number']} · AFTER pixel mapping unavailable"
+            selected_region_key = st.selectbox(
+                "Confirmed region for survey",
+                confirmed_keys,
+                format_func=_confirmed_region_label,
+                key=f"demo_survey_region_{result['comparison_key']}",
+            )
+            selected_region = marker_by_key[selected_region_key]
+            affine_matrix = result.get("newer_to_reference_matrix")
+            after_pixel_x = after_pixel_y = None
+            if affine_matrix is not None:
+                try:
+                    after_pixel_x, after_pixel_y = map_reference_point_to_newer_pixel(
+                        affine_matrix, selected_region["pixel_x"], selected_region["pixel_y"]
+                    )
+                except ValueError:
+                    pass
+            geo_file = st.file_uploader(
+                "Matching georeferenced AFTER GeoTIFF (optional)",
+                type=["tif", "tiff"],
+                accept_multiple_files=False,
+                key=f"demo_georeferenced_after_{result['comparison_key']}",
+                help="Provide a valid CRS and spatial transform whose RGB pixels exactly match the selected AFTER image.",
+            )
+            georeferenced_location = None
+            uncertainty_text = None
+            if geo_file is not None:
+                try:
+                    if after_pixel_x is None:
+                        raise ValueError("The comparison did not retain a reliable mapping from its aligned canvas to the AFTER frame.")
+                    georeferenced_location = extract_georeferenced_pixel_location(
+                        geo_file.getvalue(), geo_file.name, after["rgb"],
+                        after_pixel_x, after_pixel_y,
+                    )
+                    uncertainty_text = (
+                        f"Approx. +/-{georeferenced_location.uncertainty_m:.2f} m from the raster pixel footprint; not a survey-accuracy estimate."
+                        if georeferenced_location.uncertainty_m is not None
+                        else "Raster pixel-footprint uncertainty could not be calculated; coordinates need field verification."
+                    )
+                except (ValueError, OSError) as error:
+                    st.warning("Location extraction unavailable: the supplied GeoTIFF could not be verified against this AFTER image.")
+                    st.caption(str(error))
+            with st.container(border=True):
+                st.subheader("Stage 3 - Detected Change - Location Review")
+                st.write(f"Property: {selected_location['property_reference'] if selected_location else 'Not linked'}")
+                st.write(f"Case: {selected_case_id or 'Not linked'}")
+                st.write(f"Selected change region: {selected_region['marker_number']}")
+                if georeferenced_location is not None:
+                    st.write(f"Detected change latitude / longitude: {georeferenced_location.latitude:.8f}, {georeferenced_location.longitude:.8f}")
+                    st.write(f"Location source: {geo_file.name} - {georeferenced_location.crs}")
+                    st.write(f"Accuracy / uncertainty: {uncertainty_text}")
+                    st.caption("Status: Location Verified - georeferenced AFTER image matched the selected image pixels.")
+                elif selected_location and selected_location["verification_status"] != "Verified":
+                    st.caption("Status: Awaiting Location Verification.")
+                else:
+                    st.caption("Status: Unavailable \u2014 Demo Image.")
+                if selected_location and selected_location["verification_status"] == "Verified":
+                    st.info(
+                        "Registered Property Location \u2014 Not the Exact Detected Change Location: "
+                        f"{float(selected_location['latitude']):.8f}, {float(selected_location['longitude']):.8f}"
+                    )
+                if georeferenced_location is None:
+                    st.warning(
+                        "Location extraction unavailable: this demo image has no verified geographic reference. "
+                        "Register or verify the property location, or supply properly georeferenced imagery."
+                    )
+                    st.warning(
+                        "DEMO ONLY \u2014 The red marker shows a pixel location in the example image. "
+                        "It is not a verified GPS coordinate or proof of illegal construction."
+                    )
+            st.markdown("### Stage 4 - Drone input hand-off")
+            if st.button(
+                "Prepare Drone Surveillance",
+                type="primary",
+                key=f"demo_extract_prepare_{result['comparison_key']}",
+            ):
+                st.session_state["demo_location_action_marker"] = selected_region_key
+                st.rerun()
+
+            active_marker_key = st.session_state.get("demo_location_action_marker")
+            if active_marker_key == selected_region_key:
+                active_marker = marker_by_key[selected_region_key]
+                st.markdown("### Location review and survey hand-off")
+                if after_pixel_x is not None:
+                    st.caption(f"Selected region {active_marker['marker_number']} · AFTER-image pixel ({after_pixel_x:.1f}, {after_pixel_y:.1f}).")
+                else:
+                    st.warning("The selected region cannot be mapped back to a reliable AFTER-image pixel.")
+
+                if georeferenced_location is not None:
+                    st.success("Detected-region coordinates were extracted from the matching georeferenced AFTER image.")
+                    st.write(f"**Detected-region latitude / longitude:** {georeferenced_location.latitude:.8f}, {georeferenced_location.longitude:.8f}")
+                    st.write(f"**Location source:** {geo_file.name} · {georeferenced_location.crs}")
+                    st.caption("Extraction method: map the AFTER-frame pixel center through the GeoTIFF affine transform, then transform its CRS to WGS 84 latitude/longitude.")
+                    uncertainty_text = (
+                        f"Approx. ±{georeferenced_location.uncertainty_m:.2f} m from the raster pixel footprint; "
+                        "not a survey-accuracy estimate."
+                        if georeferenced_location.uncertainty_m is not None
+                        else "Raster pixel-footprint uncertainty could not be calculated; coordinates need field verification."
+                    )
+                    st.caption(uncertainty_text)
+                    st.image(
+                        georeferenced_location.source_rgb,
+                        caption="Unmarked georeferenced AFTER source image",
+                        alt="Source GeoTIFF matching the selected AFTER frame",
+                        width="stretch",
+                    )
+
+                property_option = (
+                    "Registered property location for a general site inspection (not the detected region)"
+                )
+                manual_option = "Enter coordinates from a separately verified location source"
+                location_options = []
+                if georeferenced_location is not None:
+                    location_options.append("Detected region from matching georeferenced AFTER image")
+                if selected_location and selected_location["verification_status"] == "Verified":
+                    location_options.append(property_option)
+                location_options.append(manual_option)
+                if selected_location is not None and not selected_location["verification_status"] == "Verified":
+                    st.info(
+                        "The registered property coordinates are not verified. Location-based field surveillance "
+                        "cannot be prepared until an authorized officer verifies the property location."
+                    )
+
+                if location_options:
+                    chosen_location_source = st.radio(
+                        "Proposed survey location",
+                        location_options,
+                        key=f"demo_location_source_{active_marker_key}",
+                    )
+                    manual_location_ready = True
+                    if chosen_location_source == manual_option:
+                        st.caption("Enter WGS 84 coordinates from a field reading or trusted mapping workflow. Do not estimate them from the demo image, a red mark, or image pixels.")
+                        manual_latitude = st.text_input(
+                            "Verified construction location latitude (WGS 84)",
+                            key=f"demo_manual_latitude_{active_marker_key}",
+                            placeholder="e.g. 12.345678",
+                        )
+                        manual_longitude = st.text_input(
+                            "Verified construction location longitude (WGS 84)",
+                            key=f"demo_manual_longitude_{active_marker_key}",
+                            placeholder="e.g. 76.543210",
+                        )
+                        manual_reference = st.text_input(
+                            "Trusted location source or reference",
+                            key=f"demo_manual_location_reference_{active_marker_key}",
+                        )
+                        manual_uncertainty = st.text_input(
+                            "Available location accuracy or uncertainty",
+                            key=f"demo_manual_location_uncertainty_{active_marker_key}",
+                        )
+                        try:
+                            proposed_latitude = float(manual_latitude)
+                            proposed_longitude = float(manual_longitude)
+                            if not (
+                                np.isfinite(proposed_latitude)
+                                and -90 <= proposed_latitude <= 90
+                                and np.isfinite(proposed_longitude)
+                                and -180 <= proposed_longitude <= 180
+                            ):
+                                raise ValueError
+                        except ValueError:
+                            manual_location_ready = False
+                            proposed_latitude = proposed_longitude = 0.0
+                            st.info("Enter valid latitude and longitude from a separately verified source to continue.")
+                        if not manual_reference.strip() or not manual_uncertainty.strip():
+                            manual_location_ready = False
+                            st.info("Add the trusted source/reference and its accuracy or uncertainty before continuing.")
+                        location_source = "Officer-entered coordinates from a separately verified mapping or field source"
+                        location_uncertainty = manual_uncertainty.strip() or "Not supplied"
+                        location_source_reference = manual_reference.strip() or None
+                        if manual_location_ready:
+                            st.info("These are officer-entered coordinates from a separate source; they were not extracted from the demo image or its marked pixels.")
+                    elif chosen_location_source == property_option:
+                        proposed_latitude = float(selected_location["latitude"])
+                        proposed_longitude = float(selected_location["longitude"])
+                        location_source = "Registered property location for a general site inspection"
+                        location_uncertainty = (
+                            "Registered property coordinates only; not the detected region. "
+                            f"Verification evidence: {selected_location['verification_evidence'] or 'not recorded'}. "
+                            "Coordinate accuracy is not quantified in the property record."
+                        )
+                        location_source_reference = None
+                        st.info(
+                            f"Property location only — not the detected change location: "
+                            f"{proposed_latitude:.8f}, {proposed_longitude:.8f} · "
+                            f"{selected_location['verification_status']}"
+                        )
+                    else:
+                        proposed_latitude = georeferenced_location.latitude
+                        proposed_longitude = georeferenced_location.longitude
+                        location_source = f"Georeferenced AFTER GeoTIFF: {geo_file.name} ({georeferenced_location.crs})"
+                        location_uncertainty = uncertainty_text
+                        location_source_reference = None
+
+                    if manual_location_ready:
+                        location_signature = hashlib.sha256(json.dumps([
+                            active_marker_key, chosen_location_source,
+                            proposed_latitude, proposed_longitude, location_uncertainty,
+                            location_source_reference,
+                        ], sort_keys=True).encode("utf-8")).hexdigest()[:12]
+                        location_review_key = f"demo_confirm_location_{active_marker_key}_{location_signature}"
+                        location_confirmed = st.checkbox(
+                            "I reviewed and confirm this proposed location for human survey planning.",
+                            key=location_review_key,
+                        )
+                        if not selected_location_id or not selected_case_id:
+                            st.info("Select a registered property and related case above before preparing a survey task.")
+                        elif after_pixel_x is None or after_pixel_y is None:
+                            st.error("The selected region cannot be mapped to an AFTER-image pixel, so a survey task cannot be prepared safely.")
+                        elif selected_location["verification_status"] != "Verified":
+                            st.warning("Survey-task preparation is blocked until an authorized officer verifies the registered property location.")
+                        elif not location_confirmed:
+                            st.info("Confirm the proposed location above to continue to the task summary.")
+                        else:
+                            if chosen_location_source == property_option:
+                                task_purpose = "General property site inspection"
+                            elif chosen_location_source == manual_option:
+                                task_purpose = "Officer-supplied construction location review"
+                            else:
+                                task_purpose = "Targeted potential change review"
+                            reason = st.text_input(
+                                "Reason for survey",
+                                value=f"Officer review of potential visual change in region {active_marker['marker_number']}",
+                                key=f"demo_survey_reason_{active_marker_key}",
+                            )
+                            officer_notes = st.text_area(
+                                "Officer notes",
+                                key=f"demo_survey_notes_{active_marker_key}",
+                            )
+                            assigned_to = st.text_input(
+                                "Assigned officer or pilot",
+                                key=f"demo_survey_assigned_{active_marker_key}",
+                            )
+                            schedule_type = st.selectbox(
+                                "Proposed schedule",
+                                ("One-time", "Weekly", "Monthly"),
+                                key=f"demo_survey_schedule_{active_marker_key}",
+                            )
+                            scheduled_for = st.datetime_input(
+                                "Proposed survey date and time",
+                                value=datetime.now().replace(second=0, microsecond=0) + timedelta(days=1),
+                                key=f"demo_survey_datetime_{active_marker_key}",
+                            )
+                            permission_reference = st.text_input(
+                                "Permission or clearance reference (if available)",
+                                key=f"demo_survey_permission_{active_marker_key}",
+                            )
+                            with st.container(border=True):
+                                st.markdown("**Survey task summary — review before saving**")
+                                st.write(f"Property: {selected_location['property_reference']}")
+                                st.write(f"Case: {selected_case_id}")
+                                st.write(
+                                    f"Region {active_marker['marker_number']} · AFTER pixel "
+                                    f"({after_pixel_x:.1f}, {after_pixel_y:.1f})"
+                                )
+                                st.write(f"Latitude / longitude: {proposed_latitude:.8f}, {proposed_longitude:.8f}")
+                                st.write(f"Location source: {location_source}")
+                                st.write(f"Location uncertainty: {location_uncertainty}")
+                                st.write(f"Dates: BEFORE {result['before_date']} · AFTER {result['after_date']}")
+                                st.write(f"Purpose: {task_purpose}")
+                                st.write(f"Reason: {reason or 'Required before saving'}")
+                                st.write(f"Officer notes: {officer_notes or 'None entered'}")
+                                st.write(f"Assigned to: {assigned_to or 'Required before saving'}")
+                                st.write(f"Proposed schedule: {schedule_type}")
+                                st.write(f"Proposed survey date/time: {scheduled_for.strftime('%Y-%m-%d %H:%M')} (local time)")
+                                st.write(f"Permission/clearance reference: {permission_reference or 'Not entered'}")
+                                st.warning(
+                            "Drone surveillance is subject to applicable registration, airspace, safety, and permission requirements. "
+                            "SmartPanchayat prepares a survey hand-off; it does not authorise or control drone flights."
+                                )
+                            task_signature = hashlib.sha256(json.dumps([
+                                selected_region_key, selected_case_id, selected_location_id,
+                                chosen_location_source, proposed_latitude, proposed_longitude,
+                                location_source, location_uncertainty, location_source_reference,
+                                reason, officer_notes,
+                                assigned_to, schedule_type, permission_reference,
+                                scheduled_for.isoformat(timespec="minutes"),
+                                result["before_date"], result["after_date"],
+                            ], sort_keys=True).encode("utf-8")).hexdigest()[:12]
+                            task_confirmed = st.checkbox(
+                                "I confirm this task summary is correct and ready to save for human review.",
+                                key=f"demo_confirm_task_{active_marker_key}_{task_signature}",
+                            )
+                            if st.button(
+                                "Prepare survey task",
+                                type="primary",
+                                disabled=not (task_confirmed and reason.strip() and assigned_to.strip()),
+                                key=f"demo_save_survey_task_{active_marker_key}",
+                            ):
+                                evidence_path = None
+                                evidence_created = False
+                                try:
+                                    if location_source_reference is None and chosen_location_source != property_option:
+                                        location_source_reference, evidence_path, evidence_created = _save_georeferenced_evidence(geo_file.getvalue())
+                                    with get_connection() as connection:
+                                        task, created = create_verified_survey_task(
+                                            connection,
+                                            active_marker_key,
+                                            property_location_id=selected_location_id,
+                                            case_id=selected_case_id,
+                                            latitude=proposed_latitude,
+                                            longitude=proposed_longitude,
+                                            after_pixel_x=after_pixel_x,
+                                            after_pixel_y=after_pixel_y,
+                                            location_source=location_source,
+                                            location_uncertainty=location_uncertainty,
+                                            location_source_reference=location_source_reference,
+                                            task_purpose=task_purpose,
+                                            reason=reason,
+                                            officer_notes=officer_notes,
+                                            assigned_to=assigned_to,
+                                            schedule_type=schedule_type,
+                                            scheduled_for=scheduled_for.isoformat(timespec="minutes"),
+                                            permission_reference=permission_reference,
+                                            before_date=result["before_date"],
+                                            after_date=result["after_date"],
+                                            actor_identity=reviewer["username"],
+                                        )
+                                    if not created and evidence_created:
+                                        evidence_path.unlink(missing_ok=True)
+                                    st.success(
+                                        f"Survey task {task['task_id']} - {task['task_status']} "
+                                        f"(proposed: {task['scheduled_for'] or 'date/time not set'}). "
+                                        f"{'Created' if created else 'Already existed'}; no drone flight was launched or authorized."
+                                    )
+                                except (ValueError, OSError, sqlite3.Error) as error:
+                                    if evidence_created and evidence_path is not None:
+                                        evidence_path.unlink(missing_ok=True)
+                                    st.error(f"Survey task could not be prepared: {error}")
+
+def _png_bytes(rgb):
+    success, encoded = cv2.imencode(".png", cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR))
+    if not success:
+        raise OSError("Image could not be encoded for comparison.")
+    return encoded.tobytes()
+
+
+def _render_saved_property_imagery(location):
+    with get_connection() as connection:
+        pairs = connection.execute(
+            "SELECT * FROM property_imagery_pairs WHERE property_location_id = ? ORDER BY created_at DESC",
+            (location["location_id"],),
+        ).fetchall()
+    if not pairs:
+        st.info("No saved before/after imagery is linked to this property yet. Upload a dated pair below or save a retrieved comparison.")
+        return
+    pair_by_key = {row["comparison_key"]: row for row in pairs}
+    chosen_key = st.selectbox(
+        "Saved before/after comparison",
+        list(pair_by_key),
+        format_func=lambda key: f"{pair_by_key[key]['before_date']} → {pair_by_key[key]['after_date']} · {pair_by_key[key]['method']}",
+        key=f"saved_property_pair_{location['location_id']}",
+    )
+    pair = pair_by_key[chosen_key]
+    with get_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM change_markers WHERE comparison_key = ? ORDER BY marker_number",
+            (pair["comparison_key"],),
+        ).fetchall()
+    refs = json.loads(pair["image_refs_json"] or "{}")
+    left, right = st.columns(2)
+    for column, label, role in ((left, "BEFORE", "before"), (right, "AFTER", "after")):
+        column.markdown(f"**{label} image**")
+        path = _evidence_path_from_reference(refs.get(role))
+        if path and path.is_file():
+            if role == "after" and rows:
+                with Image.open(path) as saved_image:
+                    rgb = np.asarray(saved_image.convert("RGB"))
+                saved_markers = [ChangeMarker(
+                    row["marker_key"], row["marker_number"], row["pixel_x"], row["pixel_y"],
+                    row["pixel_radius"], row["region_pixels"], row["latitude"], row["longitude"],
+                    row["radius_m"], row["area_sqm"],
+                ) for row in rows]
+                column.image(draw_change_markers(rgb, saved_markers), width="stretch")
+            else:
+                column.image(str(path), width="stretch")
+        else:
+            column.info("Saved image file is unavailable; marker metadata remains stored.")
+        date_value = refs.get(f"{role}_date", "Not recorded")
+        column.caption(
+            f"Acquired: {date_value} | Source: {refs.get(f'{role}_source', 'Officer upload')} | "
+            f"Resolution: {refs.get(f'{role}_resolution_m') or 'unknown'} m/pixel | "
+            f"CRS: {refs.get(f'{role}_crs') or 'not georeferenced'} | "
+            f"Valid data: {refs.get(f'{role}_valid_pct') if refs.get(f'{role}_valid_pct') is not None else 'unknown'}% | "
+            f"Cloud: {refs.get(f'{role}_cloud_pct') if refs.get(f'{role}_cloud_pct') is not None else 'unknown'}%"
+        )
+    st.caption(f"Latest saved comparison: {pair['before_date']} → {pair['after_date']} · {pair['method']}")
+    if rows:
+        st.dataframe([
+        {"Marker": f"{row['marker_number']}", "Centre": f"{row['latitude']:.6f}, {row['longitude']:.6f}" if row["latitude"] is not None else "Not georeferenced",
+         "Radius (m)": round(row["radius_m"], 1) if row["radius_m"] is not None else "—",
+         "Review": row["review_status"], "Warnings": "; ".join(json.loads(row["warnings_json"] or "[]")),
+         "Region": "Pixel-difference region; not a measured building or construction area"}
+        for row in rows
+        ], width="stretch", hide_index=True)
     else:
-        st.success("All existing case records have an associated mapped location.")
+        st.info("The latest comparison is saved. No regions met the minimum marker size.")
+
+
+def _render_property_imagery_panel(locations):
+    st.divider()
+    st.subheader("Property imagery and potential changes")
+    st.caption("Upload dated before and after images. A red circle marks a filtered pixel-difference region for officer verification.")
+    if not locations:
+        st.info("Register a property point first. The map does not invent property coordinates.")
+        return
+    by_id = {int(item["location_id"]): item for item in locations}
+    selected_id = st.selectbox(
+        "Property for imagery review", list(by_id),
+        format_func=lambda key: f"{by_id[key]['property_reference']} · Ward {by_id[key]['ward_number'] or 'not recorded'}",
+        key="property_imagery_location",
+    )
+    location = by_id[selected_id]
+    permits = load_permit_records(selected_id)
+    if permits:
+        verified = next((item for item in permits if item["verification_status"] == "Verified"), None)
+        st.caption(f"Permit record: {verified['verification_status']} ({verified['permit_number']})" if verified else f"Permit status not verified · {len(permits)} local record(s) require officer review.")
+    else:
+        st.caption("Permit status not verified. No local permit record is linked; this does not establish whether a permit exists.")
+    if location["verification_status"] != "Verified":
+        st.warning("Property coordinates are not verified. Verify them against an authorised source before geographic interpretation or drone hand-off.")
+    else:
+        st.caption(f"Verified property point: {location['latitude']:.6f}, {location['longitude']:.6f}")
+    _render_saved_property_imagery(location)
+    st.markdown("**Upload a before/after pair**")
+    before_col, after_col = st.columns(2)
+    with before_col:
+        before_file = st.file_uploader("Before image (GeoTIFF recommended)", type=["tif", "tiff", "jpg", "jpeg", "png"], key=f"prop_before_{selected_id}")
+        before_date = st.date_input("Before acquisition date", value=date(2024, 1, 1), key=f"prop_before_date_{selected_id}")
+    with after_col:
+        after_file = st.file_uploader("After image (GeoTIFF recommended)", type=["tif", "tiff", "jpg", "jpeg", "png"], key=f"prop_after_{selected_id}")
+        after_date = st.date_input("After acquisition date", value=date(2025, 1, 1), key=f"prop_after_date_{selected_id}")
+    st.caption("10 m/pixel imagery can screen for large changes only; it cannot show individual buildings. Manual JPG/PNG uploads without a spatial reference produce pixel markers only and disable drone hand-off.")
+    if before_file is None or after_file is None:
+        st.info("Next step: upload both dated images. GeoTIFFs must contain a CRS and geotransform for geographic marker coordinates.")
+        return
+    if st.button("Compare and mark potential changes", type="primary", key=f"compare_property_{selected_id}"):
+        try:
+            before = read_aerial_upload(before_file.getvalue(), before_file.name, before_date)
+            after = read_aerial_upload(after_file.getvalue(), after_file.name, after_date)
+            validation = validate_aerial_pair(before, after)
+            if before.georeferenced:
+                if before.rgb.shape != after.rgb.shape or before.crs != after.crs:
+                    raise ValueError("GeoTIFF pair must use the same CRS and pixel dimensions. Reproject both images to one common grid first.")
+                if not np.allclose(tuple(before.transform), tuple(after.transform), rtol=0, atol=1e-7):
+                    raise ValueError("GeoTIFF pair must use the same pixel grid. Reproject both images to one common grid first.")
+            if before.georeferenced:
+                common_valid = np.asarray(before.valid_mask, dtype=bool) & np.asarray(after.valid_mask, dtype=bool)
+                if common_valid.mean() < 0.5:
+                    raise ValueError("At least half of the shared image grid must contain valid pixels.")
+                earlier_quality = assess_rgb_quality(before.rgb, image_format="Georeferenced officer GeoTIFF",
+                    valid_mask=common_valid, cloud_assessment="Unknown: upload has no separate cloud/shadow mask.")
+                newer_quality = assess_rgb_quality(after.rgb, image_format="Georeferenced officer GeoTIFF",
+                    valid_mask=common_valid, cloud_assessment="Unknown: upload has no separate cloud/shadow mask.")
+                compatibility = assess_pair_compatibility(earlier_quality, newer_quality)
+                valid_alignment = (common_valid.astype(np.uint8) * 255)
+                alignment = AlignmentReport(
+                    status="Pass", method="Matching CRS and affine geotransform",
+                    confidence=1.0, transform_description="No pixel warp; both GeoTIFFs share the verified pixel grid.",
+                    aligned_newer_rgb=after.rgb.copy(), valid_mask=valid_alignment,
+                )
+                warnings = list(earlier_quality.warnings) + list(newer_quality.warnings) + list(compatibility.warnings)
+                ready = earlier_quality.status != "Unsuitable" and newer_quality.status != "Unsuitable" and compatibility.status != "Unsuitable"
+                assessment = ComparisonAssessment(
+                    earlier_quality, newer_quality, compatibility, alignment, ready,
+                    "Unsuitable" if not ready else ("Warning" if warnings else "Pass"),
+                    compatibility.reason if not ready else None, warnings,
+                    list(earlier_quality.recommendations) + list(newer_quality.recommendations) + list(compatibility.recommendations),
+                )
+            else:
+                old_png, new_png = _png_bytes(before.rgb), _png_bytes(after.rgb)
+                assessment = assess_comparison_inputs(old_png, new_png)
+            if not assessment.ready:
+                raise ValueError(assessment.reason or "Image quality or alignment checks blocked comparison.")
+            comparison = compare_images(old_png, new_png, assessment=assessment)
+            comparison_key = hashlib.sha256(
+                f"property:{selected_id}:{before_date}:{after_date}:".encode()
+                + hashlib.sha256(before_file.getvalue()).digest()
+                + hashlib.sha256(after_file.getvalue()).digest()
+            ).hexdigest()
+            markers = extract_change_markers(
+                comparison.mask, comparison_key=comparison_key, minimum_region_pixels=64,
+                transform=before.transform if before.georeferenced else None,
+                crs=before.crs if before.georeferenced else None,
+                image_bounds_wgs84=before.bounds_wgs84 if before.georeferenced else None,
+                property_point=(location["latitude"], location["longitude"]),
+            )
+            with get_connection() as connection:
+                existing_pair = connection.execute(
+                    "SELECT image_refs_json FROM property_imagery_pairs WHERE comparison_key = ?",
+                    (comparison_key,),
+                ).fetchone()
+            if existing_pair:
+                image_refs = json.loads(existing_pair["image_refs_json"])
+            else:
+                saved_refs, _ = _save_evidence_images(
+                    _encode_evidence_image(before.rgb), _encode_evidence_image(after.rgb)
+                )
+                image_refs = {
+                    "before": saved_refs[0], "after": saved_refs[1],
+                    "before_date": before_date.isoformat(), "after_date": after_date.isoformat(),
+                    "before_source": before.source, "after_source": after.source,
+                    "before_resolution_m": before.resolution_m, "after_resolution_m": after.resolution_m,
+                    "before_crs": before.crs, "after_crs": after.crs,
+                    "before_valid_pct": before.valid_data_percentage, "after_valid_pct": after.valid_data_percentage,
+                    "before_cloud_pct": before.cloud_percentage, "after_cloud_pct": after.cloud_percentage,
+                }
+            with get_connection() as connection:
+                upsert_change_markers(
+                    connection, comparison_key, selected_id, location["associated_case_id"], markers,
+                    method="Aligned OpenCV filtered pixel differencing",
+                    parameters={"minimum_region_pixels": 64}, image_refs=image_refs,
+                    quality_report=json.loads(_comparison_quality_json(assessment)),
+                    actor_identity=st.session_state["authenticated_user"]["username"],
+                )
+                record_audit_event(
+                    connection, location["associated_case_type"] or "image_detection",
+                    location["associated_case_id"] or comparison_key,
+                    "property_imagery_compared",
+                    note=f"Dated image comparison for property {location['property_reference']}; {len(markers)} potential regions retained.",
+                    actor_identity=st.session_state["authenticated_user"]["username"],
+                )
+            st.session_state[f"property_overlay_{selected_id}"] = {
+                "rgb": draw_change_markers(comparison.aligned_newer_rgb, markers),
+                "markers": markers, "validation": validation, "key": comparison_key,
+                "quality": assessment.status,
+            }
+            st.rerun()
+        except (ImageryUploadError, ValueError, OSError, sqlite3.Error, cv2.error) as error:
+            st.error(f"Comparison could not be saved: {error}")
+
+    preview = st.session_state.get(f"property_overlay_{selected_id}")
+    if preview:
+        st.markdown("**Potential Construction Change — Verification Required**")
+        st.info("Permit status not verified unless a permit record is linked. Each red circle is a pixel-difference region, not a measured building or area of construction.")
+        for warning in preview["validation"].warnings:
+            st.warning(warning)
+        if preview["quality"] == "Warning":
+            st.warning("Image quality or registration has warnings. Inspect both images and the overlay before acting.")
+        st.image(preview["rgb"], caption="AFTER image with numbered red marker outlines", width="stretch")
+        if not preview["markers"]:
+            st.info("No regions met the configured minimum size in this comparison.")
+        else:
+            st.dataframe([{"Marker": item.number, "Centre": f"{item.latitude:.6f}, {item.longitude:.6f}" if item.georeferenced else "Not georeferenced, location unverified",
+                           "Radius (m)": round(item.radius_m, 1) if item.radius_m is not None else "—",
+                           "Region area (m²)": round(item.area_sqm, 1) if item.area_sqm is not None else "—",
+                           "Warnings": "; ".join(item.warnings) or "None"} for item in preview["markers"]], width="stretch", hide_index=True)
+            with get_connection() as connection:
+                saved_markers = connection.execute("SELECT * FROM change_markers WHERE comparison_key = ? ORDER BY marker_number", (preview["key"],)).fetchall()
+            marker_by_key = {row["marker_key"]: row for row in saved_markers}
+            selected_marker_key = st.selectbox("Review marker", list(marker_by_key), format_func=lambda key: f"Marker {marker_by_key[key]['marker_number']} · {marker_by_key[key]['review_status']}", key=f"marker_review_select_{selected_id}")
+            review_reason = st.text_input("Review reason", key=f"marker_reason_{selected_id}")
+            reviewer = st.session_state.get("authenticated_user", {})
+            if can_manage_surveillance(reviewer):
+                c1, c2, c3 = st.columns(3)
+                for column, status, label in ((c1, "Confirmed for surveillance", "Confirm for survey"), (c2, "Dismissed", "Dismiss"), (c3, "Uncertain", "Uncertain")):
+                    if column.button(label, key=f"marker_{status}_{selected_id}"):
+                        try:
+                            with get_connection() as connection:
+                                update_marker_review(connection, selected_marker_key, status, review_reason, reviewer["username"])
+                            st.success("Marker review saved and audited.")
+                            st.rerun()
+                        except ValueError as error:
+                            st.error(str(error))
+            else:
+                st.caption("Sign in as an Officer or Admin to review markers and create pilot hand-off tasks.")
+            active_marker = marker_by_key[selected_marker_key]
+            if active_marker["review_status"] == "Confirmed for surveillance":
+                st.markdown("**Prepare drone survey hand-off**")
+                st.warning("Drone flights in India are subject to the Drone Rules 2021 and Digital Sky airspace and permission requirements. SmartPanchayat does not authorise, schedule, or control flights and does not verify clearance.")
+                assigned = st.text_input("Assigned pilot/officer", key=f"assigned_pilot_{selected_id}")
+                margin = st.number_input("Additional buffer margin (m)", min_value=0.0, value=20.0, step=5.0, key=f"buffer_margin_{selected_id}")
+                permission = st.text_input("Permission reference (manual)", key=f"permission_ref_{selected_id}")
+                altitude = st.number_input("Suggested altitude (m; pilot must assess)", min_value=20.0, max_value=120.0, value=60.0, step=5.0, key=f"suggested_altitude_{selected_id}")
+                overlap = st.slider("Suggested image overlap (%)", min_value=50, max_value=90, value=70, key=f"suggested_overlap_{selected_id}")
+                st.caption(f"Task preview: {location['property_reference']} · target {active_marker['latitude']:.6f}, {active_marker['longitude']:.6f} · buffer {((active_marker['radius_m'] or 0) + margin):.1f} m · weekly follow-up suggestion.")
+                with st.expander("Mission brief"):
+                    st.write(f"Property: {location['property_reference']}")
+                    st.write(f"Target: {active_marker['latitude']:.6f}, {active_marker['longitude']:.6f}")
+                    st.write(f"Survey area: approximately {((active_marker['radius_m'] or 0) + margin):.1f} m radius around the pixel-difference marker.")
+                    st.write(f"Suggested altitude: {altitude:.0f} m; suggested overlap: {overlap}% (editable suggestions only; pilot to assess).")
+                    st.write("Capture the full buffer area, surrounding context, and a repeat georeferenced image for comparison.")
+                    st.warning("Drone flights in India are subject to the Drone Rules 2021 and Digital Sky airspace and permission requirements. SmartPanchayat does not authorise, schedule, or control flights and does not verify clearance.")
+                if active_marker["latitude"] is None or location["verification_status"] != "Verified":
+                    st.warning("Drone hand-off is disabled until both the image location and registered property point are verified.")
+                elif can_manage_surveillance(reviewer):
+                    if st.button("Create/update pilot hand-off task", type="primary", key=f"create_survey_task_{selected_id}"):
+                        try:
+                            with get_connection() as connection:
+                                task = create_or_update_surveillance_task(
+                                    connection, selected_marker_key, buffer_margin_m=margin,
+                                    risk_priority="Officer review", assigned_to=assigned,
+                                    actor_identity=reviewer["username"], permission_reference=permission,
+                                    suggested_altitude_m=altitude, suggested_overlap_pct=overlap,
+                                )
+                            st.success(f"Pilot hand-off task {task['task_id']} is ready. No flight was commanded.")
+                            st.rerun()
+                        except ValueError as error:
+                            st.error(str(error))
+                with get_connection() as connection:
+                    task = connection.execute("SELECT * FROM surveillance_tasks WHERE marker_key = ?", (selected_marker_key,)).fetchone()
+                if task:
+                    refs = json.loads(active_marker["image_refs_json"] or "{}")
+                    st.caption(f"Task {task['task_id']} · {task['task_status']} · weekly schedule · assigned to {task['assigned_to']}")
+                    st.download_button("Download GeoJSON", export_task_geojson(task, location["property_reference"], refs.get("before_date"), refs.get("after_date")), file_name=f"survey-{task['task_id']}.geojson", mime="application/geo+json")
+                    st.download_button("Download KML", export_task_kml(task, location["property_reference"], task["reason"]), file_name=f"survey-{task['task_id']}.kml", mime="application/vnd.google-earth.kml+xml")
+                    st.download_button("Download CSV", export_task_csv(task, location["property_reference"], refs.get("before_date"), refs.get("after_date"), task["reason"]), file_name=f"survey-{task['task_id']}.csv", mime="text/csv")
 
 
 def render_image_comparison():
@@ -3676,10 +4658,36 @@ def render_image_comparison():
     except (ValueError, OSError, cv2.error) as error:
         st.error(f"Image assessment or comparison failed: {error}")
 
+def _render_login():
+    st.title("Sign in to SmartPanchayat")
+    with get_connection() as connection:
+        account_count = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    if account_count == 0:
+        st.info("No accounts exist yet. An administrator must run the one-time first-admin setup from PowerShell.")
+        st.code(".\\.venv\\Scripts\\python.exe create_first_admin.py", language="powershell")
+    with st.form("smartpanchayat_login"):
+        username = st.text_input("Username", max_chars=120)
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary")
+    if submitted:
+        try:
+            with get_connection() as connection:
+                user = authenticate(connection, username, password)
+            if user:
+                st.session_state["authenticated_user"] = user
+                st.rerun()
+            st.error("Username or password is incorrect, or the account is disabled.")
+        except ImportError:
+            st.error("Install the declared argon2-cffi dependency before using local password login.")
+
+
 initialize_database()
 refresh_all_risk_assessments()
 
 apply_theme(st)
+if not st.session_state.get("authenticated_user"):
+    _render_login()
+    st.stop()
 
 
 def _choose_navigation(destination):
@@ -3690,19 +4698,32 @@ if "navigation" not in st.session_state:
     st.session_state["navigation"] = "Dashboard"
 
 st.sidebar.markdown('<div class="sp-brand">SmartPanchayat</div>', unsafe_allow_html=True)
-st.sidebar.markdown('<div class="sp-brand-subtitle">Officer workspace</div>', unsafe_allow_html=True)
-navigation_sections = (
-    ("OVERVIEW", (("Dashboard", "Dashboard"),)),
-    ("CASES", (("Register case", "Register Case"), ("Saved cases", "Saved Cases"))),
-    ("MONITORING", (("Automatic Change Detection", "Change Detection"), ("Historical Imagery", "Historical Imagery"), ("Image comparison", "Image Comparison"))),
-    ("PROPERTIES", (("GPS Property Map", "GPS Property Map"), ("Permit Registry", "Permit Verification"))),
-    ("INVESTIGATION", (("Alert management", "Officer Alerts & Risk"),)),
+st.sidebar.markdown(
+    '<div class="sp-brand-subtitle">Property Change Review and Field Survey</div>',
+    unsafe_allow_html=True,
 )
+st.sidebar.markdown(
+    '<div class="sp-sidebar-description">Property records, visual change reviews, and officer follow-up in one workspace.</div>',
+    unsafe_allow_html=True,
+)
+navigation_sections = (
+    ("OVERVIEW", (("Dashboard", "Dashboard", ":material/dashboard:"),)),
+    ("CASES", (("Register case", "Register Case", ":material/add_box:"), ("Saved cases", "Saved Cases", ":material/folder_open:"))),
+    ("PROPERTIES", (("GPS Property Map", "Properties", ":material/location_on:"), ("Historical Imagery", "Historical Imagery", ":material/satellite_alt:"))),
+    ("INVESTIGATION", (("Alert management", "Officer Alerts", ":material/notifications_active:"),)),
+    ("SYSTEM", (("About the System", "About the System", ":material/info:"),)),
+    ("ADDITIONAL TOOLS", (("Permit Registry", "Permit Registry", ":material/verified_user:"),)),
+)
+st.sidebar.caption(f"Signed in: {st.session_state['authenticated_user']['username']} · {st.session_state['authenticated_user']['role']}")
+if st.sidebar.button("Sign out", key="sign_out"):
+    st.session_state.pop("authenticated_user", None)
+    st.rerun()
 for section, destinations in navigation_sections:
     st.sidebar.markdown(f'<div class="sp-section-label">{section}</div>', unsafe_allow_html=True)
-    for destination, label in destinations:
+    for destination, label, icon in destinations:
         st.sidebar.button(
             label,
+            icon=icon,
             key=f"navigation_{destination.replace(' ', '_').lower()}",
             type="primary" if st.session_state["navigation"] == destination else "secondary",
             use_container_width=True,
@@ -3713,7 +4734,7 @@ st.sidebar.markdown(
     '<div class="sp-system-status">System Status<br><strong>Database: Connected</strong></div>',
     unsafe_allow_html=True,
 )
-render_header(st)
+render_header(st, st.session_state.get("authenticated_user"))
 page = st.session_state["navigation"]
 
 if page == "Dashboard":
@@ -3724,16 +4745,16 @@ elif page == "Saved cases":
     render_case_register()
 elif page == "Alert management":
     render_alert_management()
-elif page == "Automatic Change Detection":
-    render_automatic_change_detection()
 elif page == "GPS Property Map":
     render_gps_property_map()
 elif page == "Historical Imagery":
     render_historical_imagery()
 elif page == "Permit Registry":
     render_permit_registry()
+elif page == "About the System":
+    render_about_system()
 else:
-    render_image_comparison()
+    render_gps_property_map()
 
 st.divider()
 st.caption("Potential changes require officer verification.")
